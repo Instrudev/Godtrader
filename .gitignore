@@ -1,6 +1,5 @@
 # Credenciales y datos sensibles
 .env
-*.db
 .claude/
 
 # Python
