@@ -29,7 +29,10 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from database import DB_PATH, init_db, insert_trade, get_winrate_by_hour, update_trade_result_simple
+from database import (
+    DB_PATH, init_db, insert_trade, get_winrate_by_hour,
+    update_trade_result_simple, update_trade_post_analysis,
+)
 from indicators import (
     build_dataframe,
     compute_prng_features,
@@ -520,6 +523,16 @@ class AssetScanner:
             logger.info(f"[SCANNER] {asset}: dirección indeterminada. Skip.")
             return False
 
+        # ── Filtro anti-repetición de pérdidas ───────────────────────────────
+        try:
+            from regime_filter import loss_pattern_filter
+            lp_result = loss_pattern_filter(df, asset, direction)
+            if not lp_result.allow:
+                logger.info(f"[SCANNER] {asset}: ✗ {lp_result.reason}")
+                return False
+        except Exception as e:
+            logger.debug(f"[SCANNER] loss_pattern_filter error: {e}")
+
         # ── Contexto de mercado (siempre necesario para persistir) ────────────
         try:
             last      = df.iloc[-1]
@@ -761,6 +774,131 @@ class AssetScanner:
                 "profit":    profit,
             },
         )
+
+        # ── Auto-aprendizaje: analizar pérdida ───────────────────────────────
+        if result == "LOSS":
+            self._schedule_coro(
+                self._analyze_loss(db_id, asset, direction, mem_record.get("entry", 0.0), expiry_min)
+            )
+
+    async def _analyze_loss(
+        self, db_id: int, asset: str, direction: str, entry_price: float, expiry_min: int
+    ) -> None:
+        """
+        Analiza una pérdida para auto-aprendizaje.
+
+        1. Espera 5 velas adicionales después del cierre
+        2. Fetcha velas durante y después del trade
+        3. Calcula max_adverse_pips, max_favorable_pips, price_after_5
+        4. Clasifica el tipo de pérdida
+        5. Guarda en la BD
+        """
+        # Esperar 5 velas extra para ver qué pasó después
+        await asyncio.sleep(5 * CANDLE_INTERVAL + 5)
+
+        try:
+            # Fetch velas que cubran el trade + 5 velas post
+            total_candles = expiry_min + 10
+            raw = await asyncio.to_thread(
+                iq_service.get_candles, asset, CANDLE_INTERVAL, total_candles
+            )
+            if not raw or len(raw) < expiry_min + 5:
+                logger.warning(f"[LEARN] {asset}: datos insuficientes para análisis post-trade")
+                return
+
+            closes = [float(c.get("close", 0)) for c in raw]
+            highs = [float(c.get("high", 0)) for c in raw]
+            lows = [float(c.get("low", 0)) for c in raw]
+
+            # Las velas del trade son las últimas (expiry_min + 5 + algo de buffer)
+            # Buscamos la vela de entrada por proximidad de precio
+            trade_start = -(expiry_min + 5 + 1)
+            trade_end = -6  # 5 velas antes del final
+            post_start = -5  # últimas 5 velas = post-trade
+
+            trade_highs = highs[trade_start:trade_end] if abs(trade_start) <= len(highs) else highs
+            trade_lows = lows[trade_start:trade_end] if abs(trade_start) <= len(lows) else lows
+
+            if not trade_highs or entry_price == 0:
+                return
+
+            # Max adverse pips (peor momento en contra)
+            if direction == "CALL":
+                max_adverse = entry_price - min(trade_lows)
+                max_favorable = max(trade_highs) - entry_price
+            else:  # PUT
+                max_adverse = max(trade_highs) - entry_price
+                max_favorable = entry_price - min(trade_lows)
+
+            # Normalizar a pips
+            if entry_price > 10:  # JPY pairs
+                max_adverse_pips = max_adverse * 100
+                max_favorable_pips = max_favorable * 100
+            else:
+                max_adverse_pips = max_adverse * 10000
+                max_favorable_pips = max_favorable * 10000
+
+            # Precio 5 velas después del cierre
+            price_after_5 = closes[-1] if closes else None
+
+            # Clasificar tipo de pérdida
+            loss_type = self._classify_loss(
+                direction, entry_price, price_after_5,
+                max_adverse_pips, max_favorable_pips
+            )
+
+            # Guardar en BD
+            update_trade_post_analysis(
+                trade_id=db_id,
+                loss_type=loss_type,
+                price_after_5=price_after_5,
+                max_adverse_pips=round(max_adverse_pips, 2),
+                max_favorable_pips=round(max_favorable_pips, 2),
+            )
+
+            logger.info(
+                f"[LEARN] {asset} loss analizada: {loss_type} | "
+                f"adverse={max_adverse_pips:.1f}p favorable={max_favorable_pips:.1f}p | "
+                f"price_after_5={price_after_5}"
+            )
+
+        except Exception as e:
+            logger.error(f"[LEARN] Error analizando pérdida trade {db_id}: {e}")
+
+    @staticmethod
+    def _classify_loss(
+        direction: str, entry_price: float, price_after_5: Optional[float],
+        max_adverse_pips: float, max_favorable_pips: float
+    ) -> str:
+        """
+        Clasifica el tipo de pérdida para auto-aprendizaje.
+
+        Tipos:
+          - spread:            perdió por margen mínimo (< 2 pips)
+          - entrada_prematura: el precio eventualmente fue a favor (after_5 confirma)
+          - falsa_reversion:   nunca tuvo movimiento favorable significativo
+          - tendencia_fuerte:  gran movimiento en contra (> 10 pips)
+        """
+        # Spread: perdió por muy poco
+        if max_adverse_pips < 2.0 and max_favorable_pips < 2.0:
+            return "spread"
+
+        # Tendencia fuerte: gran movimiento en contra
+        if max_adverse_pips > 10.0:
+            return "tendencia_fuerte"
+
+        # Entrada prematura: después de 5 velas el precio fue a nuestro favor
+        if price_after_5 is not None:
+            if direction == "CALL" and price_after_5 > entry_price:
+                return "entrada_prematura"
+            if direction == "PUT" and price_after_5 < entry_price:
+                return "entrada_prematura"
+
+        # Falsa reversión: nunca tuvo movimiento favorable significativo
+        if max_favorable_pips < 1.5:
+            return "falsa_reversion"
+
+        return "falsa_reversion"
 
     # ─── Notificaciones ───────────────────────────────────────────────────────
 

@@ -30,7 +30,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from database import get_winrate_by_hour, get_winrate_by_weekday
+from database import get_winrate_by_hour, get_winrate_by_weekday, fetch_recent_losses
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,14 @@ MIN_PAYOUT             = 0.80   # payout mínimo del par para operar
 MAX_DAILY_LOSSES       = 3      # pérdidas diarias máximas (auto-shutdown)
 MAX_CONSECUTIVE_LOSSES = 3      # pérdidas consecutivas máximas (auto-shutdown)
 MAX_TRADES_PER_DAY     = 15    # operaciones diarias máximas
+BLOCKED_HOURS          = frozenset({0, 1, 2, 3, 14})   # horas UTC con winrate < 40%
+BLOCKED_WEEKDAYS       = frozenset({1, 5})              # 1=Martes, 5=Sábado
+BLOCKED_ASSETS         = frozenset({"GBPUSD-OTC", "EURGBP-OTC"})  # winrate < 43%
+MIN_STREAK_LENGTH      = 3     # rachas de 1-2 velas no tienen edge
+LOSS_PATTERN_DAYS      = 7     # días hacia atrás para buscar patrones de pérdida
+LOSS_PATTERN_MIN_COUNT = 3     # mínimo de pérdidas similares para bloquear
+LOSS_PATTERN_RSI_TOL   = 8.0   # tolerancia de RSI para considerar "similar"
+LOSS_PATTERN_BB_TOL    = 0.15  # tolerancia de bb_pct_b para considerar "similar"
 
 
 # ─── Resultado del filtro ─────────────────────────────────────────────────────
@@ -299,6 +307,119 @@ def drift_filter(asset: str) -> FilterResult:
     return FilterResult.ok()
 
 
+def blocked_hours_filter(hour: int) -> FilterResult:
+    """Bloquea horas UTC con winrate históricamente < 40%."""
+    if hour in BLOCKED_HOURS:
+        return FilterResult.block(
+            "blocked_hours_filter",
+            f"Hora {hour:02d}h UTC bloqueada (winrate histórico < 40%)",
+        )
+    return FilterResult.ok()
+
+
+def blocked_weekday_filter(weekday: int) -> FilterResult:
+    """Bloquea días de la semana con winrate históricamente < 37%."""
+    names = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+    if weekday in BLOCKED_WEEKDAYS:
+        return FilterResult.block(
+            "blocked_weekday_filter",
+            f"{names[weekday]} bloqueado (winrate histórico < 37%)",
+        )
+    return FilterResult.ok()
+
+
+def blocked_asset_filter(asset: str) -> FilterResult:
+    """Bloquea activos con winrate históricamente < 43%."""
+    if asset in BLOCKED_ASSETS:
+        return FilterResult.block(
+            "blocked_asset_filter",
+            f"{asset} bloqueado (winrate histórico < 43%)",
+        )
+    return FilterResult.ok()
+
+
+def min_streak_filter(df: pd.DataFrame) -> FilterResult:
+    """Bloquea si la señal viene de una racha de 1-2 velas (sin edge demostrado)."""
+    try:
+        from indicators import get_streak_info
+        streak = get_streak_info(df)
+        length = streak.get("current_length", 0)
+        if streak.get("is_extreme") and length < MIN_STREAK_LENGTH:
+            return FilterResult.block(
+                "min_streak_filter",
+                f"Racha de {length} velas insuficiente (mínimo {MIN_STREAK_LENGTH})",
+            )
+    except Exception:
+        pass
+    return FilterResult.ok()
+
+
+def loss_pattern_filter(
+    df: pd.DataFrame,
+    asset: str,
+    direction: str,
+    days: int = LOSS_PATTERN_DAYS,
+    min_count: int = LOSS_PATTERN_MIN_COUNT,
+    rsi_tol: float = LOSS_PATTERN_RSI_TOL,
+    bb_tol: float = LOSS_PATTERN_BB_TOL,
+) -> FilterResult:
+    """
+    Bloquea si las condiciones actuales son similares a pérdidas recientes recurrentes.
+
+    Compara RSI, bb_pct_b, dirección, hora y tipo de pérdida actuales contra
+    las pérdidas de los últimos N días. Si hay >= min_count pérdidas con
+    condiciones similares, bloquea para no repetir el error.
+    """
+    try:
+        losses = fetch_recent_losses(days=days, min_count=1)
+    except Exception as e:
+        logger.debug(f"loss_pattern_filter: error consultando pérdidas ({e}). Pasando.")
+        return FilterResult.ok()
+
+    if not losses:
+        return FilterResult.ok()
+
+    last = df.iloc[-1]
+    current_rsi = float(last.get("rsi", 50.0))
+    current_bb = float(last.get("bb_pct_b", 0.5) or 0.5)
+    current_hour = int(last.get("hour_utc", 0) or 0)
+
+    # Contar pérdidas con condiciones similares
+    similar = []
+    for loss in losses:
+        # Misma dirección
+        if loss.get("direction") != direction:
+            continue
+        # RSI similar (dentro de tolerancia)
+        loss_rsi = loss.get("rsi")
+        if loss_rsi is None or abs(float(loss_rsi) - current_rsi) > rsi_tol:
+            continue
+        # BB similar
+        loss_bb = loss.get("bb_pct_b")
+        if loss_bb is None or abs(float(loss_bb) - current_bb) > bb_tol:
+            continue
+        # Misma hora (±1)
+        loss_hour = loss.get("hour_utc")
+        if loss_hour is not None and abs(int(loss_hour) - current_hour) > 1:
+            continue
+
+        similar.append(loss)
+
+    if len(similar) >= min_count:
+        # Tipo de pérdida más frecuente
+        types = [s.get("loss_type", "desconocido") for s in similar]
+        most_common = max(set(types), key=types.count)
+
+        return FilterResult.block(
+            "loss_pattern_filter",
+            f"Patrón de pérdida detectado: {len(similar)} pérdidas similares "
+            f"en últimos {days}d ({direction} RSI≈{current_rsi:.0f} BB≈{current_bb:.2f} "
+            f"h={current_hour}) | tipo frecuente: {most_common}",
+        )
+
+    return FilterResult.ok()
+
+
 # ─── Función compuesta ────────────────────────────────────────────────────────
 
 def check_all_filters(
@@ -306,6 +427,7 @@ def check_all_filters(
     asset: str,
     trade_log: List[Dict],
     payout: Optional[float] = None,
+    direction: Optional[str] = None,
     min_winrate: float = MIN_WINRATE_HOURLY,
     min_payout: float = MIN_PAYOUT,
     max_daily_losses: int = MAX_DAILY_LOSSES,
@@ -316,19 +438,27 @@ def check_all_filters(
     Aplica todos los filtros en orden de menor a mayor coste computacional.
     Devuelve el primer FilterResult que bloquea, o FilterResult.ok() si todos pasan.
 
-    Orden de evaluación:
-      1. Pérdidas diarias (auto-shutdown, barato)
-      2. Pérdidas consecutivas (auto-shutdown, barato)
-      3. Máximo de operaciones diarias (barato)
-      4. Drift del generador (archivo en disco, barato)
-      5. Perfil horario (DB, medio)
-      6. Perfil por día de semana (DB, medio)
-      7. Volatilidad / ATR (cálculo numérico, medio)
-      8. Payout (valor pasado como parámetro, barato)
+    Orden de evaluación (baratos primero):
+      1. Hora bloqueada (instantáneo)
+      2. Día bloqueado (instantáneo)
+      3. Activo bloqueado (instantáneo)
+      4. Pérdidas diarias (auto-shutdown, barato)
+      5. Pérdidas consecutivas (auto-shutdown, barato)
+      6. Máximo de operaciones diarias (barato)
+      7. Drift del generador (archivo en disco, barato)
+      8. Perfil horario (DB, medio)
+      9. Perfil por día de semana (DB, medio)
+     10. Volatilidad / ATR (cálculo numérico, medio)
+     11. Payout (valor pasado como parámetro, barato)
+     12. Racha mínima (cálculo, medio)
+     13. Patrón de pérdida (DB, medio)
     """
     now_utc = datetime.now(timezone.utc)
 
     filters_to_run = [
+        lambda: blocked_hours_filter(now_utc.hour),
+        lambda: blocked_weekday_filter(now_utc.weekday()),
+        lambda: blocked_asset_filter(asset),
         lambda: daily_loss_filter(trade_log, max_daily_losses),
         lambda: consecutive_loss_filter(trade_log, max_consecutive),
         lambda: max_trades_filter(trade_log, max_trades),
@@ -337,6 +467,8 @@ def check_all_filters(
         lambda: weekday_profile_filter(now_utc.weekday(), asset, min_winrate),
         lambda: volatility_filter(df),
         lambda: payout_filter(payout, min_payout),
+        lambda: min_streak_filter(df),
+        lambda: loss_pattern_filter(df, asset, direction) if direction else FilterResult.ok(),
     ]
 
     for run_filter in filters_to_run:

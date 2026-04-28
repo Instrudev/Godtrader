@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -106,6 +107,11 @@ _ML_COLUMNS = [
     ("prng_turning_point_ratio",  "REAL"),
     ("prng_autocorr_lag2",        "REAL"),
     ("prng_autocorr_lag5",        "REAL"),
+    # Análisis post-trade (auto-aprendizaje de pérdidas)
+    ("loss_type",            "TEXT"),    # "falsa_reversion"|"entrada_prematura"|"spread"|"tendencia_fuerte"
+    ("price_after_5",        "REAL"),    # precio 5 velas después del cierre
+    ("max_adverse_pips",     "REAL"),    # máximo movimiento en contra durante el trade
+    ("max_favorable_pips",   "REAL"),    # máximo movimiento a favor durante el trade
 ]
 
 
@@ -186,6 +192,60 @@ def update_trade_result_simple(
     sql = "UPDATE trades SET result=?, profit=?, closed_at=? WHERE id=?"
     with sqlite3.connect(path) as conn:
         conn.execute(sql, (result, profit, closed_at, trade_id))
+
+
+def update_trade_post_analysis(
+    trade_id: int,
+    loss_type: str,
+    price_after_5: Optional[float] = None,
+    max_adverse_pips: Optional[float] = None,
+    max_favorable_pips: Optional[float] = None,
+    path: Path = DB_PATH,
+) -> None:
+    """Rellena los campos de análisis post-trade para auto-aprendizaje."""
+    sql = """
+        UPDATE trades
+           SET loss_type         = ?,
+               price_after_5     = ?,
+               max_adverse_pips  = ?,
+               max_favorable_pips = ?
+         WHERE id = ?
+    """
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            sql,
+            (loss_type, price_after_5, max_adverse_pips, max_favorable_pips, trade_id),
+        )
+
+
+def fetch_recent_losses(
+    days: int = 7,
+    min_count: int = 3,
+    path: Path = DB_PATH,
+) -> List[Dict[str, Any]]:
+    """
+    Devuelve pérdidas recientes con análisis post-trade para el filtro anti-repetición.
+
+    Args:
+        days:      Últimos N días.
+        min_count: Solo devuelve si hay al menos este número de pérdidas.
+
+    Returns:
+        Lista de dicts con los campos del trade (solo LOSS con loss_type no NULL).
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    sql = """
+        SELECT * FROM trades
+         WHERE result = 'LOSS'
+           AND loss_type IS NOT NULL
+           AND timestamp >= ?
+         ORDER BY timestamp DESC
+    """
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(sql, (cutoff,)).fetchall()
+    losses = [dict(row) for row in rows]
+    return losses if len(losses) >= min_count else []
 
 
 def fetch_trades(
