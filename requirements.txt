@@ -1,0 +1,37 @@
+# Dependencias del bot OTC de Exnova
+# Generado con: pip freeze | grep <paquetes relevantes>
+#
+# NOTA: iqoptionapi se instala desde GitHub (no hay versión en PyPI con soporte Exnova):
+#   pip install git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
+
+# Web framework
+fastapi==0.136.0
+uvicorn==0.44.0
+starlette==1.0.0
+
+# Análisis de datos
+numpy==2.4.4
+pandas==3.0.2
+PyYAML==6.0.3
+
+# ML
+lightgbm==4.6.0
+scikit-learn==1.8.0
+scipy==1.17.1
+joblib==1.5.3
+threadpoolctl==3.6.0
+
+# Broker
+# iqoptionapi @ git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
+
+# LLM fallback (opcional)
+ollama==0.6.1
+
+# Utilidades
+python-dotenv==1.2.2
+anyio==4.13.0
+httpx==0.28.1
+
+# Testing (dev)
+pytest>=9.0.0
+pytest-anyio>=0.0.0

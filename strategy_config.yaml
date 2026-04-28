@@ -1,0 +1,86 @@
+# strategy_config.yaml – Configuración de estrategia OTC por par y franja horaria
+#
+# Filosofía: en OTC el edge viene de detectar regularidades del generador de precios
+# del broker (PRNG/simulador), NO de análisis técnico clásico. La estrategia base
+# es mean-reversion: cuando una racha direccional es estadísticamente larga para
+# ese par, operar la reversión.
+#
+# Todos los valores se pueden sobreescribir por activo o por franja horaria.
+
+default:
+  # ── Ornstein-Uhlenbeck (mean reversion) ──────────────────────────────────────
+  # half-life en velas M1 (≈ minutos). Si la half-life estimada es mayor, el par
+  # no muestra suficiente mean reversion para la estrategia.
+  half_life_max_candles: 25
+
+  # ── Detección de rachas ───────────────────────────────────────────────────────
+  # Percentil histórico que debe superar la racha actual para considerarla extrema.
+  # Una racha en el percentil 75 significa que el 75% de las rachas históricas son
+  # más cortas → alta probabilidad de reversión inminente.
+  streak_percentile_min: 70
+
+  # ── ATR relativo ──────────────────────────────────────────────────────────────
+  # ATR actual / media ATR de la ventana. Fuera de este rango: no operar.
+  rel_atr_min: 0.40   # mercado demasiado quieto
+  rel_atr_max: 2.50   # mercado en volatilidad extrema
+
+  # ── Price action como filtro secundario ───────────────────────────────────────
+  # Si true: exige al menos un patrón confirmatorio (pin bar o engulfing) alineado
+  # con la dirección de la señal. Solo como filtro adicional, no como señal primaria.
+  require_price_action: false
+
+  # ── Fallback al filtro clásico ────────────────────────────────────────────────
+  # Si no hay racha extrema, usar el filtro clásico RSI+BB como fallback.
+  enable_classical_fallback: true
+  classical_rsi_threshold: 35     # RSI < threshold → sobrevendido (CALL)
+  classical_bb_pct_b_max: 0.15    # precio en zona baja de BB
+  classical_bb_pct_b_min: 0.85    # precio en zona alta de BB (PUT)
+
+# ── Perfiles por activo ───────────────────────────────────────────────────────
+# Sobreescriben los valores de 'default' para ese activo específico.
+assets:
+  EURUSD-OTC:
+    streak_percentile_min: 75
+    half_life_max_candles: 20
+
+  AUDCAD-OTC:
+    streak_percentile_min: 75
+    half_life_max_candles: 20
+
+  GBPJPY-OTC:
+    streak_percentile_min: 70
+    half_life_max_candles: 30
+    rel_atr_max: 3.0              # JPY pairs pueden tener alta volatilidad estructural
+
+  USDJPY-OTC:
+    streak_percentile_min: 80     # más selectivo: pair con comportamiento más errático
+    half_life_max_candles: 25
+
+  EURGBP-OTC:
+    streak_percentile_min: 75
+    half_life_max_candles: 20
+
+# ── Perfiles por franja horaria (UTC) ────────────────────────────────────────
+# 'hours' es una lista de horas (0-23). El perfil se aplica cuando la hora UTC
+# actual está en esa lista. El primer perfil que coincida gana.
+time_profiles:
+  - name: asia_low_vol
+    hours: [0, 1, 2, 3, 4, 5]
+    rel_atr_min: 0.30             # en Asia el volumen es menor; aceptar ATR más bajo
+    streak_percentile_min: 80     # más exigentes porque el generador tiende a ser errático
+
+  - name: london_open
+    hours: [7, 8, 9]
+    rel_atr_max: 3.0              # London open puede tener volatilidad alta
+    streak_percentile_min: 70
+
+  - name: us_overlap
+    hours: [13, 14, 15, 16, 17]
+    streak_percentile_min: 70
+    rel_atr_min: 0.50             # esperar volatilidad mínima en US session
+
+  - name: weekend
+    hours: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+            13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    # Solo aplica sábado/domingo (verificar weekday en código)
+    streak_percentile_min: 80     # fines de semana: generador OTC más errático

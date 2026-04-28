@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MarketAI — Exnova Bot</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/lightweight-charts@3.8.0/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+    <audio id="ding-sound" src="https://freesound.org/data/previews/162/162456_311243-lq.mp3" preload="auto"></audio>
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- Login -->
+    <div id="login-overlay" class="overlay">
+        <div class="login-card">
+            <h2>Bienvenido</h2>
+            <p>Conecta tu cuenta de Exnova</p>
+            <form id="login-form">
+                <div class="input-group">
+                    <label for="email">Email</label>
+                    <input type="email" id="email" name="email" required placeholder="tu@email.com">
+                </div>
+                <div class="input-group">
+                    <label for="password">Contraseña</label>
+                    <input type="password" id="password" name="password" required placeholder="••••••••">
+                </div>
+                <button type="submit" id="login-btn">Conectar</button>
+                <p id="login-error" class="error-msg"></p>
+            </form>
+        </div>
+    </div>
+
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h1>GOD<span>TRADER</span></h1>
+            </div>
+            <div class="search-container">
+                <input type="text" id="asset-search" placeholder="Buscar activo...">
+            </div>
+            <div class="asset-list-container">
+                <ul id="asset-list">
+                    <li class="loading">Cargando activos...</li>
+                </ul>
+            </div>
+            <div class="sidebar-footer">
+                <div id="connection-status" class="status connected" style="margin-bottom:10px">
+                    <span class="status-dot"></span> Conectado
+                </div>
+                <button id="logout-btn" class="logout-btn">
+                    <svg style="width:14px;height:14px;margin-right:5px;vertical-align:middle" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+                    Cerrar Sesión & Apagar
+                </button>
+            </div>
+        </aside>
+
+        <main class="main-content">
+            <!-- Header row -->
+            <header class="main-header">
+                <!-- Left: asset info -->
+                <div class="active-asset-info">
+                    <h2 id="current-asset-name">Selecciona un activo</h2>
+                    <span id="current-asset-type" class="badge">--</span>
+                </div>
+
+                <!-- Right: all controls in one horizontal line -->
+                <div class="chart-controls">
+                    <div id="live-indicator" class="indicator-pill" style="display:none">
+                        <span class="live-dot"></span>EN VIVO
+                    </div>
+                    <div id="scanner-indicator" class="indicator-pill scanner-pill" style="display:none">
+                        <span class="scanner-dot"></span>SCANNER
+                    </div>
+
+                    <select id="interval-select" class="ctrl-select">
+                        <option value="60">1 min</option>
+                        <option value="300">5 min</option>
+                        <option value="900">15 min</option>
+                        <option value="3600">1 hora</option>
+                    </select>
+
+                    <div class="ctrl-sep"></div>
+
+                    <!-- Scanner config: amount -->
+                    <div class="ctrl-inline">
+                        <span class="ctrl-label">$</span>
+                        <input type="number" id="scanner-amount" class="ctrl-num" value="1" min="1" step="1">
+                    </div>
+
+                    <!-- Scanner config: expiry -->
+                    <div class="ctrl-inline">
+                        <span class="ctrl-label">Exp</span>
+                        <select id="scanner-expiry" class="ctrl-select-sm">
+                            <option value="1">1m</option>
+                            <option value="2" selected>2m</option>
+                            <option value="3">3m</option>
+                            <option value="5">5m</option>
+                        </select>
+                    </div>
+
+                    <!-- Mode toggle -->
+                    <div class="mode-toggle">
+                        <button class="mode-btn active" data-mode="practice" id="mode-practice">Demo</button>
+                        <button class="mode-btn" data-mode="paper" id="mode-paper">Paper</button>
+                    </div>
+
+                    <!-- Scanner button -->
+                    <button id="start-scanner-btn" class="scanner-btn">
+                        ⬡ Scanner
+                    </button>
+
+                    <div class="ctrl-sep"></div>
+
+                    <!-- Bot button -->
+                    <button id="start-bot-btn" class="primary-btn" disabled>Bot</button>
+                </div>
+            </header>
+
+            <!-- Chart fills remaining space -->
+            <div id="chart-container" class="chart-container"></div>
+
+            <!-- History panel fixed at bottom -->
+            <div id="history-panel" class="history-panel">
+
+                <!-- Stats + tabs bar -->
+                <div class="stats-bar">
+                    <div class="stat-block">
+                        <span class="stat-val" id="stat-total">—</span>
+                        <span class="stat-lbl">Operaciones</span>
+                    </div>
+                    <div class="stat-sep"></div>
+                    <div class="stat-block">
+                        <span class="stat-val" id="stat-wr">—</span>
+                        <span class="stat-lbl">Win Rate</span>
+                    </div>
+                    <div class="stat-sep"></div>
+                    <div class="stat-block">
+                        <span class="stat-val" id="stat-pnl">—</span>
+                        <span class="stat-lbl">P&amp;L Neto</span>
+                    </div>
+                    <div class="stat-sep"></div>
+                    <div class="stat-block">
+                        <span class="stat-val" id="stat-pending">—</span>
+                        <span class="stat-lbl">Pendientes</span>
+                    </div>
+                    <div class="stat-spacer"></div>
+                    <div class="history-tab-group">
+                        <button class="history-tab active" data-tab="trades">Historial</button>
+                        <button class="history-tab" data-tab="signals">Último Scan</button>
+                    </div>
+                    <button id="refresh-trades-btn" class="refresh-btn" title="Actualizar">↻</button>
+                </div>
+
+                <!-- Tab: Historial -->
+                <div id="tab-trades" class="tab-content active">
+                    <table class="trades-table">
+                        <thead>
+                            <tr>
+                                <th>Fecha / Hora</th>
+                                <th>Activo</th>
+                                <th>Dir</th>
+                                <th>Estrategia</th>
+                                <th>ML%</th>
+                                <th>Exp</th>
+                                <th>Modo</th>
+                                <th>Resultado</th>
+                                <th>P&amp;L</th>
+                            </tr>
+                        </thead>
+                        <tbody id="trades-tbody">
+                            <tr><td colspan="9" class="table-empty">Cargando historial...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Tab: Último Scan -->
+                <div id="tab-signals" class="tab-content">
+                    <div id="signal-list" class="signal-list"></div>
+                </div>
+
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/app.js?v=6"></script>
+</body>
+</html>
