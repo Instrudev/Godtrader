@@ -11,6 +11,39 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 0.5 — Baseline auditable del modelo ML (2026-04-30)
+
+Snapshot inmutable del modelo en producción creado en `models/audit_baseline/`.
+- `lgbm_model_pre_audit_20260430_052304_UTC.pkl` (SHA256: `f1709cb4...`)
+- `platt_calibrator_pre_audit_20260430_052304_UTC.pkl` (SHA256: `5ef1910a...`)
+- Verificación: `cd models/audit_baseline/ && shasum -a 256 -c baseline_hashes.txt`
+
+Modelo original creado 2026-04-28 21:42 UTC con `train_model.py` manual. Sin versionado ni métricas registradas.
+
+---
+
+## Tarea 0.4 — MIN_WINRATE a 0.55 (2026-04-30)
+
+- `MIN_WINRATE_HOURLY`: 0.39 → 0.55
+- `MIN_WINRATE_WEEKDAY`: 0.39 → 0.55
+- Breakeven con payout 80-83% ≈ 54.6%. Umbral 0.55 da margen de seguridad.
+- Temporal durante remediación. Tarea 2.4 implementa walk-forward definitivo.
+
+---
+
+## Alcance ampliado de Tarea 1.5 — Auditoría ML (documentado 2026-04-30)
+
+Hallazgo durante Fase 0: `ml_classifier.predict_proba()` auto-carga `models/lgbm_model.pkl` sin verificación de integridad ni logging. Adiciones al alcance original:
+
+1. **Verificación de hash SHA256**: Al cargar el modelo, comparar hash contra baseline conocido. Si no coincide, loguear warning y reportar.
+2. **Logging de modelo cargado**: En startup y en cada predicción crítica, loguear path, hash truncado y fecha de modificación del modelo activo.
+3. **Evaluar bloqueo de auto-carga**: Considerar reemplazar auto-carga implícita (en `predict_proba`) por carga explícita (solo en startup o por trigger). Documentar decisión con pros/contras.
+4. **Verificar consistencia**: Comparar modelo en `models/lgbm_model.pkl` contra el baseline en `models/audit_baseline/` usando hashes.
+
+Estos cambios se implementarán en Tarea 1.5, no antes.
+
+---
+
 ## Tarea 0.2 — Halt Operativo (2026-04-30)
 
 ### Cambios
