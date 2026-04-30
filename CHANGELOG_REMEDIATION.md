@@ -11,6 +11,42 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 1.3 — Política de TIE en rachas consecutivas (2026-04-30)
+
+### Política definida
+`TIE_BREAKS_LOSS_STREAK = True` (default). Un TIE rompe la racha de pérdidas consecutivas.
+
+**Justificación:** Un TIE es un resultado neutral — el patrón perdedor no continuó. Ignorar el TIE (comportamiento legacy) infla artificialmente la racha y puede disparar halt prematuro. Ejemplo: LOSS, LOSS, TIE, LOSS, LOSS antes contaba como 4 consecutivas, ahora cuenta como 2.
+
+**Configurable:** Setear `TIE_BREAKS_LOSS_STREAK = False` en `regime_filter.py` para restaurar comportamiento legacy si se requiere.
+
+### Cambios en `regime_filter.py`
+- Nueva constante `TIE_BREAKS_LOSS_STREAK = True`.
+- `consecutive_loss_filter`: nuevo parámetro `tie_breaks`. Cuando `True`, TIE entra en la lista evaluada y rompe la racha con `break`. Logging debug cuando TIE rompe.
+
+### Auditoría de otros filtros
+| Filtro | Cómo maneja TIE | ¿Cambio necesario? |
+|---|---|---|
+| `consecutive_loss_filter` | Era invisible → ahora rompe racha | **Sí (esta tarea)** |
+| `daily_loss_filter` | Solo cuenta `result == "LOSS"` | No |
+| `per_asset_loss_filter` | Solo cuenta `result == "LOSS"` | No |
+| `max_trades_filter` | Cuenta `result != "PENDING"` → TIE cuenta como trade | No |
+
+Cada filtro tiene la semántica correcta para su propósito: "TIE no es pérdida" (daily/per-asset), "TIE es trade ejecutado" (max_trades), "TIE rompe patrón perdedor" (consecutive).
+
+### Test de Tarea 1.1 actualizado
+`test_consecutive_loss_filter_unchanged_by_utc_migration` actualizado de "TIE invisible" a "TIE rompe racha". El test original preveía este cambio con el comentario: "política actual, cambia en Tarea 1.3".
+
+### Tests añadidos (6)
+1. `test_tie_breaks_streak_when_flag_true` — L,L,TIE,L,L → racha=2
+2. `test_tie_invisible_when_flag_false` — L,L,TIE,L,L → racha=4
+3. `test_default_tie_policy_is_true` — constante es True
+4. `test_consecutive_blocks_with_tie_breaks_at_3` — W,L,L,L → racha=3 → bloquea
+5. `test_pure_loss_streak_unaffected_by_flag` — L,L,L → ambos flags → bloquea
+6. `test_multiple_tie_intercalated` — L,TIE,L,TIE,L → racha=1
+
+---
+
 ## Tarea 1.2 — Stop Loss dual por activo + global (2026-04-30)
 
 ### Cambios en `regime_filter.py`

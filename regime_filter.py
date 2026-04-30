@@ -49,6 +49,7 @@ MIN_PAYOUT             = 0.80   # payout mínimo del par para operar
 MAX_ASSET_DAILY_LOSSES = 3      # pérdidas máximas por activo individual en sesión UTC
 MAX_DAILY_LOSSES       = 6      # pérdidas globales máximas (auto-shutdown) — subido de 3
 MAX_CONSECUTIVE_LOSSES = 3      # pérdidas consecutivas máximas (auto-shutdown)
+TIE_BREAKS_LOSS_STREAK = True   # True = TIE rompe racha de pérdidas (resultado neutral, no continuación adversa)
 MAX_TRADES_PER_DAY     = 15    # operaciones diarias máximas
 BLOCKED_HOURS          = frozenset({0, 1, 2, 3, 14})   # horas UTC con winrate < 40%
 BLOCKED_WEEKDAYS       = frozenset({1, 5})              # 1=Martes, 5=Sábado
@@ -248,14 +249,25 @@ def daily_loss_filter(
 def consecutive_loss_filter(
     trade_log: List[Dict],
     max_consecutive: int = MAX_CONSECUTIVE_LOSSES,
+    tie_breaks: bool = TIE_BREAKS_LOSS_STREAK,
 ) -> FilterResult:
     """
     Apaga el bot tras N pérdidas consecutivas al final del trade_log.
     Una racha de pérdidas puede indicar drift del generador OTC.
 
+    Política de TIE (configurable via TIE_BREAKS_LOSS_STREAK):
+      tie_breaks=True  → TIE rompe la racha (resultado neutral, no continuación adversa).
+      tie_breaks=False → TIE es invisible (comportamiento legacy).
+
     auto_shutdown=True: apaga el bot.
     """
-    closed = [t for t in trade_log if t.get("result") in ("WIN", "LOSS")]
+    if tie_breaks:
+        # TIE entra en la secuencia evaluada y puede romper la racha
+        closed = [t for t in trade_log if t.get("result") in ("WIN", "LOSS", "TIE")]
+    else:
+        # TIE invisible: solo WIN/LOSS (comportamiento legacy)
+        closed = [t for t in trade_log if t.get("result") in ("WIN", "LOSS")]
+
     if not closed:
         return FilterResult.ok()
 
@@ -264,6 +276,8 @@ def consecutive_loss_filter(
         if t["result"] == "LOSS":
             streak += 1
         else:
+            if t["result"] == "TIE" and tie_breaks:
+                logger.debug("[CONSECUTIVE_LOSS] TIE breaks streak. Counter reset.")
             break
 
     if streak >= max_consecutive:

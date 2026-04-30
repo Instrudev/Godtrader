@@ -471,18 +471,17 @@ def test_daily_loss_counts_only_utc_today() -> None:
 
 def test_consecutive_loss_filter_unchanged_by_utc_migration() -> None:
     """consecutive_loss_filter NO usa fecha — no debe verse afectado por migración UTC.
-    TIE sigue siendo invisible (política actual, cambia en Tarea 1.3)."""
+    TIE rompe racha (Tarea 1.3: TIE_BREAKS_LOSS_STREAK=True por defecto)."""
     log = [
         _trade("WIN"),
         _trade("LOSS"),
-        _trade("TIE"),   # invisible para consecutive
+        _trade("TIE"),   # rompe la racha (política Tarea 1.3)
         _trade("LOSS"),
         _trade("LOSS"),
     ]
     result = consecutive_loss_filter(log, max_consecutive=3)
-    # TIE invisible: LOSS-TIE-LOSS-LOSS = 3 consecutivas (TIE descartado)
-    assert result.allow is False
-    assert result.auto_shutdown is True
+    # TIE rompe racha: solo 2 LOSS consecutivas al final → no bloquea
+    assert result.allow is True
 
 
 def test_max_trades_filter_uses_utc() -> None:
@@ -586,3 +585,57 @@ def test_per_asset_and_global_coexist() -> None:
         # Global: 4 losses → no halt (< 6)
         global_result = daily_loss_filter(log, max_daily_losses=6)
         assert global_result.allow is True
+
+
+# ─── Tarea 1.3: Política de TIE en rachas consecutivas ──────────────────────
+
+def test_tie_breaks_streak_when_flag_true() -> None:
+    """TIE_BREAKS=True: LOSS,LOSS,TIE,LOSS,LOSS → racha = 2 (TIE rompe)."""
+    log = [_trade("LOSS"), _trade("LOSS"), _trade("TIE"),
+           _trade("LOSS"), _trade("LOSS")]
+    result = consecutive_loss_filter(log, max_consecutive=3, tie_breaks=True)
+    assert result.allow is True  # racha = 2, no alcanza 3
+
+
+def test_tie_invisible_when_flag_false() -> None:
+    """TIE_BREAKS=False: LOSS,LOSS,TIE,LOSS,LOSS → racha = 4 (TIE invisible)."""
+    log = [_trade("LOSS"), _trade("LOSS"), _trade("TIE"),
+           _trade("LOSS"), _trade("LOSS")]
+    result = consecutive_loss_filter(log, max_consecutive=3, tie_breaks=False)
+    assert result.allow is False  # racha = 4, supera 3
+    assert result.auto_shutdown is True
+
+
+def test_default_tie_policy_is_true() -> None:
+    """La constante TIE_BREAKS_LOSS_STREAK por defecto es True."""
+    from regime_filter import TIE_BREAKS_LOSS_STREAK
+    assert TIE_BREAKS_LOSS_STREAK is True
+
+
+def test_consecutive_blocks_with_tie_breaks_at_3() -> None:
+    """TIE_BREAKS=True: WIN,LOSS,LOSS,LOSS → racha = 3 (bloquea sin TIE de por medio)."""
+    log = [_trade("WIN"), _trade("LOSS"), _trade("LOSS"), _trade("LOSS")]
+    result = consecutive_loss_filter(log, max_consecutive=3, tie_breaks=True)
+    assert result.allow is False
+    assert result.auto_shutdown is True
+
+
+def test_pure_loss_streak_unaffected_by_flag() -> None:
+    """LOSS,LOSS,LOSS sin TIE → ambos flags dan racha = 3."""
+    log = [_trade("LOSS"), _trade("LOSS"), _trade("LOSS")]
+
+    result_true = consecutive_loss_filter(log, max_consecutive=3, tie_breaks=True)
+    result_false = consecutive_loss_filter(log, max_consecutive=3, tie_breaks=False)
+
+    assert result_true.allow is False
+    assert result_false.allow is False
+    assert result_true.auto_shutdown is True
+    assert result_false.auto_shutdown is True
+
+
+def test_multiple_tie_intercalated() -> None:
+    """TIE_BREAKS=True: LOSS,TIE,LOSS,TIE,LOSS → racha = 1 (cada TIE rompe)."""
+    log = [_trade("LOSS"), _trade("TIE"), _trade("LOSS"),
+           _trade("TIE"), _trade("LOSS")]
+    result = consecutive_loss_filter(log, max_consecutive=3, tie_breaks=True)
+    assert result.allow is True  # racha = 1 (solo el último LOSS)
