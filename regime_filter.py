@@ -36,10 +36,11 @@ logger = logging.getLogger(__name__)
 
 # ─── Umbrales por defecto (todos configurables) ────────────────────────────────
 
-# MIN_WINRATE_HOURLY     = 0.52   # umbral original (restaurar cuando haya ≥50 trades)
-# MIN_WINRATE_WEEKDAY    = 0.52   # umbral original (restaurar cuando haya ≥50 trades)
-MIN_WINRATE_HOURLY     = 0.39   # umbral reducido mientras se acumulan datos (< 50 trades)
-MIN_WINRATE_WEEKDAY    = 0.39   # umbral reducido mientras se acumulan datos (< 50 trades)
+# Historial: 0.52 (original) → 0.39 (acumulación datos) → 0.55 (remediación)
+# 0.55 = breakeven con margen de seguridad sobre payout 80-83%
+# Valor temporal durante remediación. Tarea 2.4 implementa walk-forward definitivo.
+MIN_WINRATE_HOURLY     = 0.55
+MIN_WINRATE_WEEKDAY    = 0.55
 MIN_WINRATE_DATA_FLOOR = 10     # trades mínimos históricos para aplicar filtro
 ATR_PERIOD             = 14
 ATR_PERCENTILE_LOW     = 30     # bloquear si ATR está por debajo de este percentil
