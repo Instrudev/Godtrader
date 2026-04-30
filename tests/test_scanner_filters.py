@@ -5,6 +5,7 @@ Tarea 1.0: check_all_filters integrado (6 tests).
 Tarea 1.2: halt + reconstrucción trade_log (2 tests).
 Tarea 1.4: _evaluate_strategies paralelo + arbitraje (10 tests).
 Tarea 1.6: ML_DISABLED_MODE fallback (8 tests).
+Tarea 2.2: Umbrales endurecidos (8 tests).
 """
 from __future__ import annotations
 
@@ -684,3 +685,159 @@ def test_startup_banner_shows_ml_disabled(caplog):
         assert "REDUCED RISK MODE" in caplog.text
     finally:
         iqservice.ML_DISABLED_MODE = orig
+
+
+# ─── Tarea 2.2: Umbrales endurecidos ─────────────────────────────────────────
+
+def test_bb2c_rejects_below_70pct_body():
+    """BB 2-Candle: body 60% fuera de banda → no activa (umbral ahora 70%)."""
+    from indicators import detect_bb_two_candle_reversal
+    n = 30
+    df = _make_df_with_indicators(rsi=15.0)
+    # Configurar 2 velas con ~60% body debajo de bb_lower (no alcanza 70%)
+    for i in [-2, -1]:
+        df.at[df.index[i], "open"] = 1.0990
+        df.at[df.index[i], "close"] = 1.0985   # vela bajista
+        df.at[df.index[i], "low"] = 1.0980
+        df.at[df.index[i], "bb_lower"] = 1.0988  # ~60% del body debajo
+    df.at[df.index[-1], "rsi"] = 15.0
+
+    ok, direction, reason = detect_bb_two_candle_reversal(df)
+    assert ok is False  # 60% < 70% → no activa
+
+
+def test_bb2c_accepts_above_70pct_body_with_divergence():
+    """BB 2-Candle: body 85% fuera + RSI<20 + divergencia + vela alcista → activa."""
+    from indicators import detect_bb_two_candle_reversal
+    df = _make_df_with_indicators(rsi=15.0)
+    # Configurar 2 velas con ~85% body debajo de bb_lower
+    for i in [-2, -1]:
+        df.at[df.index[i], "open"] = 1.0980
+        df.at[df.index[i], "close"] = 1.0985   # vela alcista (confirmación)
+        df.at[df.index[i], "low"] = 1.0975
+        df.at[df.index[i], "high"] = 1.0990
+        df.at[df.index[i], "bb_lower"] = 1.0984  # >70% body debajo
+    df.at[df.index[-1], "rsi"] = 15.0
+    # Divergencia: low actual < low N-3, RSI actual > RSI N-3
+    df.at[df.index[-4], "low"] = 1.0980   # N-3 tiene low más alto
+    df.at[df.index[-4], "rsi"] = 12.0     # N-3 tiene RSI más bajo
+    # N actual: low=1.0975 < 1.0980, rsi=15 > 12 → divergencia alcista OK
+
+    ok, direction, reason = detect_bb_two_candle_reversal(df)
+    assert ok is True
+    assert direction == "CALL"
+    assert "divergencia" in reason.lower()
+
+
+def test_bb2c_rejects_without_rsi_divergence():
+    """BB 2-Candle: body OK + RSI OK pero sin divergencia → no activa."""
+    from indicators import detect_bb_two_candle_reversal
+    df = _make_df_with_indicators(rsi=15.0)
+    for i in [-2, -1]:
+        df.at[df.index[i], "open"] = 1.0980
+        df.at[df.index[i], "close"] = 1.0985
+        df.at[df.index[i], "low"] = 1.0975
+        df.at[df.index[i], "high"] = 1.0990
+        df.at[df.index[i], "bb_lower"] = 1.0984
+    df.at[df.index[-1], "rsi"] = 15.0
+    # Sin divergencia: low actual > low N-3 (NO lower low)
+    df.at[df.index[-4], "low"] = 1.0970   # N-3 tiene low MÁS bajo
+    df.at[df.index[-4], "rsi"] = 12.0
+
+    ok, direction, reason = detect_bb_two_candle_reversal(df)
+    assert ok is False
+    assert "divergencia" in reason.lower()
+
+
+def test_bb2c_put_divergence():
+    """BB 2-Candle PUT: body 85% sobre BB upper + RSI>80 + divergencia bajista → activa."""
+    from indicators import detect_bb_two_candle_reversal
+    df = _make_df_with_indicators(rsi=85.0)
+    for i in [-2, -1]:
+        df.at[df.index[i], "open"] = 1.1020
+        df.at[df.index[i], "close"] = 1.1015  # vela bajista (confirmación)
+        df.at[df.index[i], "high"] = 1.1025
+        df.at[df.index[i], "low"] = 1.1010
+        df.at[df.index[i], "bb_upper"] = 1.1016  # >70% body arriba
+    df.at[df.index[-1], "rsi"] = 85.0
+    # Divergencia bajista: high actual > high N-3, RSI actual < RSI N-3
+    df.at[df.index[-4], "high"] = 1.1020  # N-3 tiene high más bajo
+    df.at[df.index[-4], "rsi"] = 88.0     # N-3 tiene RSI más alto
+
+    ok, direction, reason = detect_bb_two_candle_reversal(df)
+    assert ok is True
+    assert direction == "PUT"
+
+
+def test_rsi_classical_25_75_thresholds():
+    """RSI=30 (antes activa, ahora no) y RSI=20 (activa con nuevo umbral 25)."""
+    from asset_scanner import _evaluate_strategies
+
+    # RSI=30: entre 25 y 75 → no activa RSI clásico
+    df30 = _make_df_with_indicators(rsi=30.0)
+    with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(False, None, "")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(False, "")), \
+         patch("asset_scanner.get_streak_info", return_value={"is_extreme": False, "percentile": 30, "current_length": 1, "direction": "bull"}):
+        _, _, signals30, _ = _evaluate_strategies(df30, asset="TEST")
+    rsi_sig30 = [s for s in signals30 if s.strategy_name == "rsi_classical"][0]
+    assert rsi_sig30.active is False
+
+    # RSI=20: < 25 → activa RSI clásico
+    df20 = _make_df_with_indicators(rsi=20.0)
+    with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(False, None, "")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(False, "")), \
+         patch("asset_scanner.get_streak_info", return_value={"is_extreme": False, "percentile": 30, "current_length": 1, "direction": "bull"}):
+        _, _, signals20, _ = _evaluate_strategies(df20, asset="TEST")
+    rsi_sig20 = [s for s in signals20 if s.strategy_name == "rsi_classical"][0]
+    assert rsi_sig20.active is True
+    assert rsi_sig20.direction == "CALL"
+
+
+def test_rsi_classical_bb_zone_10pct():
+    """pct_b=0.12 → no activa con zona 10% (antes sí con 15%)."""
+    from indicators import pre_qualify_classical
+    df = _make_df_with_indicators(rsi=20.0)
+    # Configurar pct_b ~0.12 (dentro de 15% pero fuera de 10%)
+    bb_low = 1.0990
+    bb_up = 1.1010
+    price = bb_low + (bb_up - bb_low) * 0.12  # pct_b = 0.12
+    df.at[df.index[-1], "close"] = price
+    df.at[df.index[-1], "bb_lower"] = bb_low
+    df.at[df.index[-1], "bb_upper"] = bb_up
+    df.at[df.index[-1], "rsi"] = 20.0
+
+    ok, reason = pre_qualify_classical(df)
+    assert ok is False  # pct_b=0.12 > 0.10 → no toca zona inferior
+
+
+def test_streak_requires_4_candles_and_pct90():
+    """Racha 3v pct=85% → no activa (necesita ≥4v y ≥90%)."""
+    from indicators import pre_qualify
+    df = _make_df_with_indicators()
+    cfg = {
+        "streak_percentile_min": 90, "rel_atr_min": 0.0, "rel_atr_max": 100.0,
+        "enable_classical_fallback": False,
+    }
+    with patch("indicators.get_streak_info", return_value={
+        "is_extreme": True, "percentile": 85, "current_length": 3,
+        "direction": "bear", "mean": 2.0, "std": 1.0,
+    }):
+        ok, reason = pre_qualify(df, asset="TEST", config=cfg)
+    assert ok is False  # pct=85 < 90 OR length=3 < 4
+
+
+def test_streak_requires_half_life_le_25():
+    """Racha 5v pct=92% pero half-life=30 → no activa (hl obligatorio ≤25)."""
+    from indicators import pre_qualify
+    df = _make_df_with_indicators()
+    cfg = {
+        "streak_percentile_min": 90, "rel_atr_min": 0.0, "rel_atr_max": 100.0,
+        "enable_classical_fallback": False,
+    }
+    with patch("indicators.get_streak_info", return_value={
+        "is_extreme": True, "percentile": 92, "current_length": 5,
+        "direction": "bear", "mean": 2.0, "std": 1.0,
+    }), patch("indicators.estimate_half_life", return_value=30.0):
+        ok, reason = pre_qualify(df, asset="TEST", config=cfg)
+    assert ok is False
+    assert "half-life" in reason.lower()

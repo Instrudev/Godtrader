@@ -401,10 +401,10 @@ def test_pre_qualify_classical_returns_tuple() -> None:
 
 
 def test_pre_qualify_classical_passes_with_oversold_rsi() -> None:
-    """Si RSI < 35 y precio en zona baja de BB, debe pasar."""
+    """Si RSI < 25 y precio en zona baja de BB (pct_b <= 0.10), debe pasar."""
     df = _make_df(250)
-    # Forzar condiciones en última vela
-    df.at[df.index[-1], "rsi"]      = 28.0
+    # Forzar condiciones en última vela (Tarea 2.2: umbrales 25/75, zone 10%)
+    df.at[df.index[-1], "rsi"]      = 20.0
     df.at[df.index[-1], "close"]    = float(df["bb_lower"].iloc[-1]) * 0.9999
     ok, reason = pre_qualify_classical(df)
     assert ok is True

@@ -11,6 +11,52 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 2.2 — Endurecer umbrales de estrategias (2026-04-30)
+
+### Cambios por estrategia
+
+**Estrategia 1 — BB Two-Candle Reversal:**
+- Body fuera de banda: 50% → **70%** (`indicators.py:482,497`)
+- **Nuevo:** Filtro de divergencia RSI obligatorio:
+  - CALL: `low[N] < low[N-3] AND RSI[N] > RSI[N-3]` (precio baja, RSI sube)
+  - PUT: `high[N] > high[N-3] AND RSI[N] < RSI[N-3]` (precio sube, RSI baja)
+- Scoring: RSI extremity referencia actualizada a 25/75
+
+**Estrategia 3 — Streak Reversal:**
+- Percentil mínimo: 70 → **90** (YAML + fallback código)
+- Racha mínima: 2 → **4** velas (`indicators.py:356`)
+- Half-life ≤ 25: opcional → **obligatorio** (nuevo check en `pre_qualify`)
+
+**Estrategia 4 — RSI + BB Clásico:**
+- Umbrales RSI: 35/65 → **25/75** (`indicators.py:406`, `asset_scanner.py:1182,1187`)
+- Zona BB: 0.15/0.85 → **0.10/0.90** (`indicators.py:409`, `asset_scanner.py:1184,1189`)
+
+**Estrategia 2 — BB Body Reversal:** Sin cambios. Será revisada en Tarea 2.3 (espejo CALL + validación).
+
+### Archivos modificados
+- `indicators.py`: BB 2-Candle (70%, divergencia RSI), RSI clásico (25/75, 10%/90%), Streak (4 velas, pct 90, half-life obligatorio)
+- `asset_scanner.py`: Scoring RSI actualizado a 25/75, zones 10%/90%, BB 2-Candle extremity 25/75
+- `strategy_config.yaml`: `streak_percentile_min: 90`, `classical_rsi_threshold: 25`, `classical_bb_pct_b_max: 0.10`, `classical_bb_pct_b_min: 0.90`
+- `tests/test_indicators_otc.py`: Test de RSI clásico actualizado (28→20)
+
+### Impacto esperado
+- BB 2-Candle: ~70-80% menos señales (70% body + divergencia = muy selectivo)
+- RSI Clásico: ~40-50% menos señales (solo RSI realmente extremo)
+- Streak: ~60-70% menos señales (pct 90 + 4 velas + half-life)
+- Compatible con `ML_DISABLED_MAX_DAILY_TRADES = 5` (0-2 trades/día esperados)
+
+### Tests añadidos (8)
+1. `test_bb2c_rejects_below_70pct_body` — body 60% < 70% → no activa
+2. `test_bb2c_accepts_above_70pct_body_with_divergence` — 85% + divergencia → CALL
+3. `test_bb2c_rejects_without_rsi_divergence` — sin divergencia → no activa
+4. `test_bb2c_put_divergence` — divergencia bajista → PUT
+5. `test_rsi_classical_25_75_thresholds` — RSI=30 no activa, RSI=20 sí
+6. `test_rsi_classical_bb_zone_10pct` — pct_b=0.12 no activa (antes sí con 15%)
+7. `test_streak_requires_4_candles_and_pct90` — 3v pct=85% → no activa
+8. `test_streak_requires_half_life_le_25` — hl=30 → no activa
+
+---
+
 ## Tarea 1.7 — Auditoría dataset ML (2026-04-30) — ÚLTIMA TAREA FASE 1
 
 ### Hallazgos

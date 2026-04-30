@@ -1140,7 +1140,7 @@ def _evaluate_strategies(
     # ── 1. BB 2-Candle Reversal ──────────────────────────────────────────────
     bb2_ok, bb2_dir, _ = detect_bb_two_candle_reversal(df)
     if bb2_ok and bb2_dir:
-        rsi_extremity = (35 - rsi) / 35 if rsi < 35 else (rsi - 65) / 35 if rsi > 65 else 0.0
+        rsi_extremity = (25 - rsi) / 25 if rsi < 25 else (rsi - 75) / 25 if rsi > 75 else 0.0
         s = round(min(0.70 + min(rsi_extremity, 1.0) * 0.25, 1.0), 4)
         signals.append(StrategySignal(True, bb2_dir, s, "bb_2candle"))
     else:
@@ -1177,16 +1177,16 @@ def _evaluate_strategies(
     else:
         signals.append(StrategySignal(False, None, 0.0, "streak"))
 
-    # ── 4. RSI Clásico + BB ──────────────────────────────────────────────────
+    # ── 4. RSI Clásico + BB (umbrales endurecidos: 25/75, zone 10%) ─────────
     pct_b = (price - bb_low) / bb_rng if bb_rng > 1e-10 else 0.5
-    if rsi < 35:
-        rsi_f = (35 - rsi) / 35
-        bb_f  = max(0.0, 0.20 - pct_b) / 0.20
+    if rsi < 25:
+        rsi_f = (25 - rsi) / 25
+        bb_f  = max(0.0, 0.10 - pct_b) / 0.10
         s = round(min(0.40 + rsi_f * 0.30 + bb_f * 0.30, 1.0), 4)
         signals.append(StrategySignal(True, "CALL", s, "rsi_classical"))
-    elif rsi > 65:
-        rsi_f = (rsi - 65) / 35
-        bb_f  = max(0.0, pct_b - 0.80) / 0.20
+    elif rsi > 75:
+        rsi_f = (rsi - 75) / 25
+        bb_f  = max(0.0, pct_b - 0.90) / 0.10
         s = round(min(0.40 + rsi_f * 0.30 + bb_f * 0.30, 1.0), 4)
         signals.append(StrategySignal(True, "PUT", s, "rsi_classical"))
     else:

@@ -17,7 +17,8 @@ default:
   # Percentil histórico que debe superar la racha actual para considerarla extrema.
   # Una racha en el percentil 75 significa que el 75% de las rachas históricas son
   # más cortas → alta probabilidad de reversión inminente.
-  streak_percentile_min: 70
+  # Tarea 2.2: subido de 70 → 90 (solo rachas estadísticamente excepcionales)
+  streak_percentile_min: 90
 
   # ── ATR relativo ──────────────────────────────────────────────────────────────
   # ATR actual / media ATR de la ventana. Fuera de este rango: no operar.
@@ -32,9 +33,11 @@ default:
   # ── Fallback al filtro clásico ────────────────────────────────────────────────
   # Si no hay racha extrema, usar el filtro clásico RSI+BB como fallback.
   enable_classical_fallback: true
-  classical_rsi_threshold: 35     # RSI < threshold → sobrevendido (CALL)
-  classical_bb_pct_b_max: 0.15    # precio en zona baja de BB
-  classical_bb_pct_b_min: 0.85    # precio en zona alta de BB (PUT)
+  # Tarea 2.2: endurecido de 35 → 25 (solo RSI realmente extremo)
+  classical_rsi_threshold: 25
+  # Tarea 2.2: endurecido de 0.15/0.85 → 0.10/0.90 (solo 10% exterior de BB)
+  classical_bb_pct_b_max: 0.10
+  classical_bb_pct_b_min: 0.90
 
 # ── Perfiles por activo ───────────────────────────────────────────────────────
 # Sobreescriben los valores de 'default' para ese activo específico.
