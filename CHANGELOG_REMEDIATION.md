@@ -11,6 +11,40 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 2.5 — Filtro de pendiente BB media — anti-caminata de banda (2026-04-30)
+
+### Problema resuelto
+En tendencias fuertes, el precio "camina" la banda superior/inferior durante 8-15 velas. Las estrategias de reversión generan señales falsas en estas condiciones. El tipo de pérdida más frecuente en Tarea 0.3 fue "tendencia_fuerte" (55% de pérdidas clasificadas).
+
+### Solución
+Nuevo filtro `bb_slope_filter` en `regime_filter.py`. Mide la pendiente de BB_mid sobre 5 velas como porcentaje del precio. Bloquea señales contra-tendencia cuando la pendiente supera el umbral.
+
+### Comportamiento
+| Pendiente | Señal CALL | Señal PUT |
+|---|---|---|
+| Fuerte positiva (≥+0.08%) | Permitida (pro-tendencia) | **Bloqueada** |
+| Fuerte negativa (≤-0.08%) | **Bloqueada** | Permitida (pro-tendencia) |
+| Lateral (~0%) | Permitida | Permitida |
+
+### Implementación
+- Constante `BB_SLOPE_THRESHOLD_PCT = 0.08` (% del precio, escala-agnóstico).
+- Filtro insertado en posición 12 de `check_all_filters` (después de `volatility_filter`, antes de `payout_filter`).
+- Fail-open: `direction=None` o `len(df) < 6` → permite.
+
+### Nota arquitectónica
+Las 4 estrategias actuales son de reversión a la media. En tendencias fuertes, este filtro bloqueará todas las señales → bot inactivo. Esto es **comportamiento deseado** durante remediación (mejor no operar que perder). Afecta velocidad de acumulación de datos para Tarea 3.1.
+
+### Tests añadidos (7)
+1. `test_bb_slope_blocks_put_in_strong_uptrend`
+2. `test_bb_slope_blocks_call_in_strong_downtrend`
+3. `test_bb_slope_allows_signals_in_lateral`
+4. `test_bb_slope_allows_put_in_downtrend` (pro-tendencia)
+5. `test_bb_slope_allows_call_in_uptrend` (pro-tendencia)
+6. `test_bb_slope_threshold_configurable`
+7. `test_bb_slope_insufficient_history_allows` (fail-open)
+
+---
+
 ## Tarea 2.2 — Endurecer umbrales de estrategias (2026-04-30)
 
 ### Cambios por estrategia

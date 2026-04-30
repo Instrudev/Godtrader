@@ -639,3 +639,101 @@ def test_multiple_tie_intercalated() -> None:
            _trade("TIE"), _trade("LOSS")]
     result = consecutive_loss_filter(log, max_consecutive=3, tie_breaks=True)
     assert result.allow is True  # racha = 1 (solo el último LOSS)
+
+
+# ─── Tarea 2.5: Filtro de pendiente BB media ─────────────────────────────────
+
+def _make_slope_df(bb_mid_values: list) -> pd.DataFrame:
+    """Crea DataFrame mínimo con bb_mid controlado para tests de pendiente."""
+    n = max(len(bb_mid_values), 10)
+    base_mid = 1.1000
+    data = {
+        "open": [base_mid] * n, "close": [base_mid] * n,
+        "high": [base_mid + 0.001] * n, "low": [base_mid - 0.001] * n,
+        "volume": [100] * n,
+        "time": pd.date_range("2026-04-30 10:00", periods=n, freq="1min"),
+        "rsi": [50.0] * n,
+        "bb_upper": [base_mid + 0.001] * n,
+        "bb_mid": [base_mid] * n,
+        "bb_lower": [base_mid - 0.001] * n,
+        "bb_width": [0.5] * n, "vol_rel": [1.0] * n,
+        "ema20": [base_mid] * n, "ema200": [base_mid] * n,
+        "rel_atr": [1.0] * n,
+    }
+    df = pd.DataFrame(data)
+    # Sobrescribir las últimas velas con los bb_mid controlados
+    for i, val in enumerate(bb_mid_values):
+        df.at[df.index[-(len(bb_mid_values) - i)], "bb_mid"] = val
+    return df
+
+
+def test_bb_slope_blocks_put_in_strong_uptrend() -> None:
+    """Tendencia alcista fuerte → señal PUT bloqueada."""
+    from regime_filter import bb_slope_filter
+    # bb_mid sube: N-5=1.1000 → N=1.1015 → slope=+0.136% (> 0.08%)
+    bb_mids = [1.1000, 1.1003, 1.1006, 1.1009, 1.1012, 1.1015]
+    df = _make_slope_df(bb_mids)
+    result = bb_slope_filter(df, direction="PUT", threshold_pct=0.08)
+    assert result.allow is False
+    assert result.filter_name == "bb_slope_filter"
+    assert "alcista" in result.reason
+
+
+def test_bb_slope_blocks_call_in_strong_downtrend() -> None:
+    """Tendencia bajista fuerte → señal CALL bloqueada."""
+    from regime_filter import bb_slope_filter
+    # bb_mid baja: N-5=1.1015 → N=1.1000 → slope=-0.136%
+    bb_mids = [1.1015, 1.1012, 1.1009, 1.1006, 1.1003, 1.1000]
+    df = _make_slope_df(bb_mids)
+    result = bb_slope_filter(df, direction="CALL", threshold_pct=0.08)
+    assert result.allow is False
+    assert "bajista" in result.reason
+
+
+def test_bb_slope_allows_signals_in_lateral() -> None:
+    """Mercado lateral (slope ~0%) → ambas señales permitidas."""
+    from regime_filter import bb_slope_filter
+    # bb_mid plano: slope ≈ 0%
+    bb_mids = [1.1000, 1.1001, 1.1000, 1.1001, 1.1000, 1.1001]
+    df = _make_slope_df(bb_mids)
+
+    result_call = bb_slope_filter(df, direction="CALL", threshold_pct=0.08)
+    result_put  = bb_slope_filter(df, direction="PUT", threshold_pct=0.08)
+    assert result_call.allow is True
+    assert result_put.allow is True
+
+
+def test_bb_slope_allows_put_in_downtrend() -> None:
+    """Tendencia bajista → señal PUT permitida (pro-tendencia)."""
+    from regime_filter import bb_slope_filter
+    bb_mids = [1.1015, 1.1012, 1.1009, 1.1006, 1.1003, 1.1000]
+    df = _make_slope_df(bb_mids)
+    result = bb_slope_filter(df, direction="PUT", threshold_pct=0.08)
+    assert result.allow is True  # PUT en bajada = pro-tendencia
+
+
+def test_bb_slope_allows_call_in_uptrend() -> None:
+    """Tendencia alcista → señal CALL permitida (pro-tendencia)."""
+    from regime_filter import bb_slope_filter
+    bb_mids = [1.1000, 1.1003, 1.1006, 1.1009, 1.1012, 1.1015]
+    df = _make_slope_df(bb_mids)
+    result = bb_slope_filter(df, direction="CALL", threshold_pct=0.08)
+    assert result.allow is True  # CALL en subida = pro-tendencia
+
+
+def test_bb_slope_threshold_configurable() -> None:
+    """Umbral configurable: slope 0.10% con threshold 0.05% → bloquea."""
+    from regime_filter import bb_slope_filter
+    # slope = +0.10% (> 0.05% threshold custom)
+    bb_mids = [1.1000, 1.1002, 1.1004, 1.1006, 1.1008, 1.1011]
+    df = _make_slope_df(bb_mids)
+    result = bb_slope_filter(df, direction="PUT", threshold_pct=0.05)
+    assert result.allow is False  # 0.10% > 0.05% threshold → bloqueado
+
+
+def test_bb_slope_insufficient_history_allows() -> None:
+    """df con menos de 6 velas → fail-open (permitido)."""
+    from regime_filter import bb_slope_filter
+    df = _make_slope_df([1.1000, 1.1010])[:4]  # solo 4 velas
+    result = bb_slope_filter(df, direction="CALL", threshold_pct=0.08)
+    assert result.allow is True  # fail-open

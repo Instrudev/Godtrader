@@ -55,6 +55,7 @@ BLOCKED_HOURS          = frozenset({0, 1, 2, 3, 14})   # horas UTC con winrate <
 BLOCKED_WEEKDAYS       = frozenset({1, 5})              # 1=Martes, 5=Sábado
 BLOCKED_ASSETS         = frozenset({"GBPUSD-OTC", "EURGBP-OTC"})  # winrate < 43%
 MIN_STREAK_LENGTH      = 3     # rachas de 1-2 velas no tienen edge
+BB_SLOPE_THRESHOLD_PCT = 0.08  # pendiente de BB_mid en % del precio (5 velas) — anti-caminata de banda
 SESSION_RESET_TIMEZONE = "UTC"  # Todos los contadores diarios se resetean a 00:00 UTC
 LOSS_PATTERN_DAYS      = 7     # días hacia atrás para buscar patrones de pérdida
 LOSS_PATTERN_MIN_COUNT = 3     # mínimo de pérdidas similares para bloquear
@@ -404,6 +405,58 @@ def per_asset_loss_filter(
     return FilterResult.ok()
 
 
+def bb_slope_filter(
+    df: pd.DataFrame,
+    direction: Optional[str],
+    threshold_pct: float = BB_SLOPE_THRESHOLD_PCT,
+) -> FilterResult:
+    """
+    Bloquea señales contra-tendencia cuando BB_mid tiene pendiente fuerte.
+
+    Mide la pendiente de la SMA central de Bollinger sobre 5 velas.
+    Si la pendiente indica tendencia fuerte y la señal es contra-tendencia,
+    bloquea (el mercado está "caminando la banda", no revirtiendo).
+
+    Señales pro-tendencia y mercados laterales pasan siempre.
+    """
+    if direction is None or len(df) < 6:
+        return FilterResult.ok()
+
+    bb_mid_now = float(df.iloc[-1]["bb_mid"])
+    bb_mid_5   = float(df.iloc[-6]["bb_mid"])
+
+    if bb_mid_now == 0:
+        return FilterResult.ok()
+
+    slope_pct = (bb_mid_now - bb_mid_5) / bb_mid_now * 100
+
+    # PUT contra tendencia alcista fuerte → bloquear
+    if direction == "PUT" and slope_pct >= threshold_pct:
+        logger.info(
+            f"[BB_SLOPE] Tendencia alcista activa (slope={slope_pct:+.3f}%), "
+            f"bloqueando señal PUT contra-tendencia"
+        )
+        return FilterResult.block(
+            "bb_slope_filter",
+            f"Tendencia alcista activa (BB_mid slope={slope_pct:+.3f}%), "
+            f"bloqueando señal PUT contra-tendencia",
+        )
+
+    # CALL contra tendencia bajista fuerte → bloquear
+    if direction == "CALL" and slope_pct <= -threshold_pct:
+        logger.info(
+            f"[BB_SLOPE] Tendencia bajista activa (slope={slope_pct:+.3f}%), "
+            f"bloqueando señal CALL contra-tendencia"
+        )
+        return FilterResult.block(
+            "bb_slope_filter",
+            f"Tendencia bajista activa (BB_mid slope={slope_pct:+.3f}%), "
+            f"bloqueando señal CALL contra-tendencia",
+        )
+
+    return FilterResult.ok()
+
+
 def min_streak_filter(df: pd.DataFrame) -> FilterResult:
     """Bloquea si la señal viene de una racha de 1-2 velas (sin edge demostrado)."""
     try:
@@ -516,9 +569,10 @@ def check_all_filters(
       9. Perfil horario (DB, medio)
      10. Perfil por día de semana (DB, medio)
      11. Volatilidad / ATR (cálculo numérico, medio)
-     12. Payout (valor pasado como parámetro, barato)
-     13. Racha mínima (cálculo, medio)
-     14. Patrón de pérdida (DB, medio)
+     12. Pendiente BB media (anti-caminata, medio)
+     13. Payout (valor pasado como parámetro, barato)
+     14. Racha mínima (cálculo, medio)
+     15. Patrón de pérdida (DB, medio)
     """
     now_utc = datetime.now(timezone.utc)
 
@@ -534,6 +588,7 @@ def check_all_filters(
         lambda: hour_profile_filter(now_utc.hour, asset, min_winrate),
         lambda: weekday_profile_filter(now_utc.weekday(), asset, min_winrate),
         lambda: volatility_filter(df),
+        lambda: bb_slope_filter(df, direction),
         lambda: payout_filter(payout, min_payout),
         lambda: min_streak_filter(df),
         lambda: loss_pattern_filter(df, asset, direction) if direction else FilterResult.ok(),
