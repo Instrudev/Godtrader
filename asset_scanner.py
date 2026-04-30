@@ -42,6 +42,7 @@ from indicators import (
     build_dataframe,
     compute_prng_features,
     detect_bb_body_reversal,
+    detect_bb_body_reversal_call,
     detect_bb_two_candle_reversal,
     get_streak_info,
     pre_qualify,
@@ -1146,25 +1147,11 @@ def _evaluate_strategies(
     else:
         signals.append(StrategySignal(False, None, 0.0, "bb_2candle"))
 
-    # ── 2. BB Body Reversal ──────────────────────────────────────────────────
-    bb_body_active = False
-    bb_body_score = 0.0
-    body = price - open_
-    if body > 0:
-        threshold = open_ + body * 0.10
-        if bb_mid <= threshold:
-            ext   = min((threshold - bb_mid) / body, 1.0)
-            rsi_f = max(0.0, (rsi - 55) / 45)
-            vol_f = min(max(vol_rel - 1.0, 0.0), 1.0) * 0.10
-            bb_body_score = round(min(0.50 + ext * 0.28 + rsi_f * 0.15 + vol_f, 1.0), 4)
-            bb_body_active = True
-    # Also check via the formal detector for filter validation (RSI>55, bb_width, vol_rel)
-    ok_formal, _ = detect_bb_body_reversal(df)
-    if ok_formal:
-        bb_body_active = True
-        if bb_body_score == 0.0:
-            bb_body_score = 0.50
-    signals.append(StrategySignal(bb_body_active, "PUT" if bb_body_active else None, bb_body_score, "bb_body"))
+    # ── 2. BB Body Reversal — DEPRECADA (Tarea 2.3) ────────────────────────
+    # No participa en decisión. Se registra como phantom en el log JSONL.
+    # Rendimiento histórico: 25% WR (1W/3L en 4 trades).
+    # Solo PUT, asimetría no validable. Deprecación instrumentada.
+    signals.append(StrategySignal(False, None, 0.0, "bb_body"))
 
     # ── 3. Streak Reversal ───────────────────────────────────────────────────
     streak = get_streak_info(df)
@@ -1208,6 +1195,20 @@ def _evaluate_strategies(
             resolution = "conflict_cancel"
             direction, winner_score = None, 0.0
 
+    # ── Instrumentación phantom BB Body (deprecada pero observada) ──────────
+    phantom_signal = None
+    try:
+        put_ok, _ = detect_bb_body_reversal(df)
+        call_ok, _ = detect_bb_body_reversal_call(df)
+        if put_ok and call_ok:
+            phantom_signal = "BOTH_phantom"
+        elif put_ok:
+            phantom_signal = "PUT_phantom"
+        elif call_ok:
+            phantom_signal = "CALL_phantom"
+    except Exception:
+        pass
+
     # ── Log JSONL ────────────────────────────────────────────────────────────
     try:
         winner_data = None
@@ -1230,6 +1231,9 @@ def _evaluate_strategies(
                 ", ".join(f"{s.strategy_name}={s.direction}" for s in active)
                 if resolution == "conflict_cancel" else None
             ),
+            "phantom_signals": {
+                "bb_body": phantom_signal,
+            },
         }
         _decision_logger.info(json.dumps(entry, separators=(",", ":")))
     except Exception:

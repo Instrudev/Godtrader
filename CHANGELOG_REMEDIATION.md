@@ -11,6 +11,54 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 2.3 — Validar Estrategia 2 BB Body con espejo CALL (2026-04-30)
+
+### Hallazgos
+
+**Rendimiento histórico:** 4 trades con BB Body (todos PUT), 1W/3L = **25% WR**. Muy por debajo del breakeven (55%).
+
+**Backtest sobre velas históricas (1,245 velas, 4 assets):**
+
+| Versión | Señales | Confirmadas | Tasa |
+|---|---|---|---|
+| PUT (original) | 79 | 37 | 47% |
+| CALL (espejo) | 55 | 25 | 45% |
+
+Ambas versiones generan señales pero con tasa de confirmación < 50% (por debajo de breakeven). La asimetría PUT-only no está justificada por los datos — CALL tiene rendimiento similar.
+
+### Decisión: deprecación instrumentada
+
+BB Body Reversal **deprecada como señal activa**. Razones:
+1. 25% WR en producción (peor estrategia de las 4).
+2. Confirmación < 50% en backtest (ambas versiones).
+3. Asimetría PUT-only no validable.
+4. Las otras 3 estrategias (con umbrales endurecidos) cubren los mismos escenarios.
+
+### Implementación
+
+- `detect_bb_body_reversal_call` añadida en `indicators.py` (espejo experimental).
+- BB Body desactivada en `_evaluate_strategies`: siempre `StrategySignal(False, None, 0.0, "bb_body")`.
+- **Instrumentación phantom**: en cada evaluación, registra si BB Body PUT o CALL habría activado. Campo `phantom_signals.bb_body` en `strategy_decisions.log` (JSONL).
+- Script `validate_bb_body_call.py`: backtest comparativo.
+- Reporte: `reports/bb_body_validation_20260430_181311_UTC.md`.
+
+### Criterios de reactivación futura
+- Phantom signals muestran WR > 55% consistente durante 30-60 días.
+- Revisión programada tras reactivación operativa post-remediación.
+
+### Test actualizado
+`test_3_call_1_put_conflict_cancel`: adaptado a BB Body deprecada (conflicto ahora via bb_2candle CALL + rsi_classical PUT).
+
+### Tests añadidos (6)
+1. `test_bb_body_call_detects_red_candle` — espejo detecta vela roja
+2. `test_bb_body_call_rejects_green_candle` — solo roja
+3. `test_bb_body_call_rsi_threshold_45` — RSI ≥ 45 no activa
+4. `test_bb_body_phantom_logged_when_active` — phantom registrado
+5. `test_bb_body_phantom_null_when_no_signals` — null sin activación
+6. `test_bb_body_not_in_evaluate_strategies_decision` — no afecta decisión
+
+---
+
 ## Tarea 2.5 — Filtro de pendiente BB media — anti-caminata de banda (2026-04-30)
 
 ### Problema resuelto

@@ -585,6 +585,59 @@ def detect_bb_body_reversal(df: pd.DataFrame) -> Tuple[bool, str]:
     )
 
 
+def detect_bb_body_reversal_call(df: pd.DataFrame) -> Tuple[bool, str]:
+    """
+    EXPERIMENTAL — Espejo CALL de detect_bb_body_reversal (Tarea 2.3).
+
+    Detecta vela ROJA gigante donde BB_mid queda en el 10% SUPERIOR del cuerpo.
+    Indica que el precio cayó de forma insostenible → presión alcista.
+
+    Condiciones (espejo simétrico de la versión PUT):
+        close < open  (vela roja)
+        bb_mid ≥ close + (open - close) * 0.90  (BB_mid en 10% superior)
+        RSI < 45      (confirma sobreextensión bajista)
+        bb_width > 0.3%
+        vol_rel ≥ 1.0
+
+    NO integrada en producción. Solo para instrumentación phantom (Tarea 2.3).
+    """
+    if len(df) < 20:
+        return False, "DataFrame insuficiente"
+
+    last     = df.iloc[-1]
+    open_    = float(last["open"])
+    close    = float(last["close"])
+    bb_mid   = float(last["bb_mid"])
+    bb_width = float(last["bb_width"])
+    rsi      = float(last["rsi"])
+    vol_rel  = float(last.get("vol_rel", 1.0))
+
+    body = open_ - close  # vela ROJA: open > close
+    if body <= 0:
+        return False, "Vela no es bajista"
+
+    # BB_mid en el 10% superior del cuerpo (espejo: close + 90% del body)
+    threshold = close + body * 0.90
+    if bb_mid < threshold:
+        return False, f"bb_mid al {(bb_mid - close) / body * 100:.0f}% del cuerpo (necesita ≥90%)"
+
+    if rsi >= 45:
+        return False, f"RSI {rsi:.1f} ≥ 45 (sin sobreextensión bajista)"
+
+    if bb_width <= 0.30:
+        return False, f"BB-Width {bb_width:.3f}% ≤ 0.30% (squeeze)"
+
+    if vol_rel < 1.0:
+        return False, f"VolRel {vol_rel:.2f}x < 1.0 (volumen insuficiente)"
+
+    ext_pct = (bb_mid - threshold) / body * 100
+    return True, (
+        f"[bb_body_call] Vela roja extendida bajo BB-Mid "
+        f"(ext={ext_pct:.0f}% sobre umbral) | RSI={rsi:.1f} | "
+        f"BB-W={bb_width:.3f}% | VolRel={vol_rel:.2f}x"
+    )
+
+
 # ─── Mantenimiento de Mercado y Caza de Liquidez ──────────────────────────────
 
 def calculate_adherence_index(df: pd.DataFrame, window: int = 30) -> str:

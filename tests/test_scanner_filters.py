@@ -398,14 +398,16 @@ def test_contradictory_directions_returns_none():
 
 
 def test_3_call_1_put_conflict_cancel():
-    """3 CALL + 1 PUT → conflict_cancel (mayoría NO gana)."""
+    """2 CALL + 1 PUT → conflict_cancel (mayoría NO gana).
+    BB Body deprecada (Tarea 2.3), así que conflicto viene de bb_2candle vs RSI."""
     from asset_scanner import _evaluate_strategies
-    df = _make_df_with_indicators(rsi=20.0)  # RSI < 35 → CALL
+    df = _make_df_with_indicators(rsi=80.0)  # RSI > 75 → PUT
 
     with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(True, "CALL", "reason")), \
-         patch("asset_scanner.detect_bb_body_reversal", return_value=(True, "reason")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(False, "")), \
+         patch("asset_scanner.detect_bb_body_reversal_call", return_value=(False, "")), \
          patch("asset_scanner.get_streak_info", return_value={"is_extreme": True, "percentile": 85, "current_length": 5, "direction": "bear"}):
-        # bb_2candle=CALL, bb_body=PUT, streak=CALL (bear→CALL), rsi_classical=CALL
+        # bb_2candle=CALL, streak=CALL (bear→CALL), rsi_classical=PUT (RSI>75)
         direction, score, signals, resolution = _evaluate_strategies(df, asset="TEST")
 
     assert direction is None
@@ -841,3 +843,57 @@ def test_streak_requires_half_life_le_25():
         ok, reason = pre_qualify(df, asset="TEST", config=cfg)
     assert ok is False
     assert "half-life" in reason.lower()
+
+
+# ─── Tarea 2.3: BB Body phantom logging ──────────────────────────────────────
+
+def test_bb_body_phantom_logged_when_active():
+    """Cuando BB Body PUT habría activado, phantom se registra en el log."""
+    from asset_scanner import _evaluate_strategies
+    df = _make_df_with_indicators(rsi=70.0)
+
+    with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(False, None, "")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(True, "phantom PUT")), \
+         patch("asset_scanner.detect_bb_body_reversal_call", return_value=(False, "")), \
+         patch("asset_scanner.get_streak_info", return_value={"is_extreme": False, "percentile": 30, "current_length": 1, "direction": "bull"}):
+        direction, score, signals, resolution = _evaluate_strategies(df, asset="TEST")
+
+    # BB Body no debe ser señal activa (deprecada)
+    bb_body_sig = [s for s in signals if s.strategy_name == "bb_body"][0]
+    assert bb_body_sig.active is False
+
+
+def test_bb_body_phantom_null_when_no_signals():
+    """Sin activación de BB Body, phantom no se registra."""
+    from asset_scanner import _evaluate_strategies
+    df = _make_df_with_indicators(rsi=50.0)
+
+    with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(False, None, "")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(False, "")), \
+         patch("asset_scanner.detect_bb_body_reversal_call", return_value=(False, "")), \
+         patch("asset_scanner.get_streak_info", return_value={"is_extreme": False, "percentile": 30, "current_length": 1, "direction": "bull"}):
+        direction, score, signals, resolution = _evaluate_strategies(df, asset="TEST")
+
+    # Todas las señales inactivas
+    assert all(not s.active for s in signals)
+    assert resolution == "no_signal"
+
+
+def test_bb_body_not_in_evaluate_strategies_decision():
+    """BB Body deprecada: su activación phantom NO afecta direction final."""
+    from asset_scanner import _evaluate_strategies
+    df = _make_df_with_indicators(rsi=50.0)
+
+    # BB Body PUT habría activado + BB 2-Candle CALL activa
+    with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(True, "CALL", "reason")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(True, "phantom PUT")), \
+         patch("asset_scanner.detect_bb_body_reversal_call", return_value=(False, "")), \
+         patch("asset_scanner.get_streak_info", return_value={"is_extreme": False, "percentile": 30, "current_length": 1, "direction": "bull"}):
+        direction, score, signals, resolution = _evaluate_strategies(df, asset="TEST")
+
+    # Direction es CALL (de BB 2-Candle), NO PUT (de BB Body phantom)
+    assert direction == "CALL"
+    assert resolution == "single_match"
+    # BB Body sigue inactiva en la lista de señales
+    bb_body_sig = [s for s in signals if s.strategy_name == "bb_body"][0]
+    assert bb_body_sig.active is False
