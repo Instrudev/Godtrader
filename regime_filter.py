@@ -62,7 +62,7 @@ TIE_BREAKS_LOSS_STREAK = True   # True = TIE rompe racha de pérdidas (resultado
 MAX_TRADES_PER_DAY     = 15    # operaciones diarias máximas
 BLOCKED_HOURS          = frozenset({0, 1, 2, 3, 14})   # horas UTC con winrate < 40%
 BLOCKED_WEEKDAYS       = frozenset({1, 5})              # 1=Martes, 5=Sábado
-BLOCKED_ASSETS         = frozenset({"GBPUSD-OTC", "EURGBP-OTC"})  # winrate < 43%
+BLOCKED_ASSETS         = frozenset()  # vacío para Fase 3 — todos los OTC elegibles
 MIN_STREAK_LENGTH      = 3     # rachas de 1-2 velas no tienen edge
 BB_SLOPE_THRESHOLD_PCT = 0.08  # pendiente de BB_mid en % del precio (5 velas) — anti-caminata de banda
 SESSION_RESET_TIMEZONE = "UTC"  # Todos los contadores diarios se resetean a 00:00 UTC
