@@ -53,10 +53,20 @@ BLOCKED_HOURS          = frozenset({0, 1, 2, 3, 14})   # horas UTC con winrate <
 BLOCKED_WEEKDAYS       = frozenset({1, 5})              # 1=Martes, 5=Sábado
 BLOCKED_ASSETS         = frozenset({"GBPUSD-OTC", "EURGBP-OTC"})  # winrate < 43%
 MIN_STREAK_LENGTH      = 3     # rachas de 1-2 velas no tienen edge
+SESSION_RESET_TIMEZONE = "UTC"  # Todos los contadores diarios se resetean a 00:00 UTC
 LOSS_PATTERN_DAYS      = 7     # días hacia atrás para buscar patrones de pérdida
 LOSS_PATTERN_MIN_COUNT = 3     # mínimo de pérdidas similares para bloquear
 LOSS_PATTERN_RSI_TOL   = 8.0   # tolerancia de RSI para considerar "similar"
 LOSS_PATTERN_BB_TOL    = 0.15  # tolerancia de bb_pct_b para considerar "similar"
+
+
+# ─── Helper: fecha UTC del día ───────────────────────────────────────────────
+
+def _today_utc() -> str:
+    """Retorna la fecha actual en UTC como string ISO (YYYY-MM-DD).
+    Todos los contadores diarios usan esta función para garantizar
+    reset a 00:00 UTC independiente del timezone del servidor."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 # ─── Resultado del filtro ─────────────────────────────────────────────────────
@@ -207,11 +217,12 @@ def daily_loss_filter(
     max_daily_losses: int = MAX_DAILY_LOSSES,
 ) -> FilterResult:
     """
-    Apaga el bot si las pérdidas cerradas hoy superan el límite configurado.
+    Apaga el bot si las pérdidas cerradas hoy (UTC) superan el límite configurado.
 
     auto_shutdown=True: este filtro apaga el bot, no solo salta el ciclo.
+    El conteo se resetea a 00:00 UTC (SESSION_RESET_TIMEZONE).
     """
-    today = date.today().isoformat()
+    today = _today_utc()
     losses_today = sum(
         1
         for t in trade_log
@@ -219,9 +230,13 @@ def daily_loss_filter(
         and str(t.get("timestamp", ""))[:10] == today
     )
     if losses_today >= max_daily_losses:
+        logger.warning(
+            f"[DAILY_LOSS] {losses_today} pérdidas hoy (UTC: {today}) ≥ límite {max_daily_losses}. "
+            "Auto-shutdown activado."
+        )
         return FilterResult.block(
             "daily_loss_filter",
-            f"{losses_today} pérdidas hoy ≥ límite {max_daily_losses}. Bot detenido por el resto del día.",
+            f"{losses_today} pérdidas hoy (UTC) ≥ límite {max_daily_losses}. Bot detenido por el resto del día.",
             shutdown=True,
         )
     return FilterResult.ok()
@@ -268,8 +283,9 @@ def max_trades_filter(
     """
     Bloquea operaciones adicionales una vez alcanzado el límite diario.
     Controla la sobreexposición en un solo día.
+    El conteo se resetea a 00:00 UTC (SESSION_RESET_TIMEZONE).
     """
-    today = date.today().isoformat()
+    today = _today_utc()
     trades_today = sum(
         1
         for t in trade_log
@@ -279,7 +295,7 @@ def max_trades_filter(
     if trades_today >= max_trades:
         return FilterResult.block(
             "max_trades_filter",
-            f"{trades_today} operaciones hoy ≥ límite {max_trades}. Esperando mañana.",
+            f"{trades_today} operaciones hoy (UTC) ≥ límite {max_trades}. Esperando mañana.",
         )
     return FilterResult.ok()
 

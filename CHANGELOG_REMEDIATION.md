@@ -11,6 +11,46 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 1.1 — Migración Stop Loss y contadores diarios a UTC (2026-04-30)
+
+### Scope original
+- Migrar `daily_loss_filter` (`date.today()` → UTC).
+
+### Scope ampliado durante auditoría
+- `max_trades_filter` (línea 272) usa la misma función `date.today()` y se migró por coherencia.
+- `consecutive_loss_filter` NO usa fecha — no requiere migración (verificado).
+
+### Cambios en `regime_filter.py`
+- Constante `SESSION_RESET_TIMEZONE = "UTC"`.
+- Helper `_today_utc()`: retorna `datetime.now(timezone.utc).strftime("%Y-%m-%d")`.
+- `daily_loss_filter`: `date.today()` → `_today_utc()` + logging UTC en shutdown.
+- `max_trades_filter`: `date.today()` → `_today_utc()` + mensaje con "(UTC)".
+
+### Auditoría temporal completa
+Todas las referencias a `date.today()` / `datetime.now()` en el repo:
+
+| Archivo | Línea | Uso | Acción |
+|---|---|---|---|
+| `regime_filter.py:214` | `daily_loss_filter` | Conteo pérdidas | **Migrado a UTC** |
+| `regime_filter.py:272` | `max_trades_filter` | Conteo trades | **Migrado a UTC** |
+| `regime_filter.py:457` | `check_all_filters` | Ya era UTC | Sin cambio |
+| `trader.py:630,672` | Logging | Deprecated | Sin cambio |
+| `backtester.py:611,648` | Nombre archivo reporte | No es conteo | Sin cambio |
+| `asset_scanner.py` | — | No usa `date.today()` | Verificado limpio |
+
+### Tests añadidos (6)
+1. `test_today_utc_helper_returns_iso_format` — formato YYYY-MM-DD sin hora
+2. `test_daily_loss_resets_at_utc_midnight` — 23:55 y 00:05 UTC = días distintos
+3. `test_daily_loss_uses_utc_not_local_timezone` — servidor UTC-5 no afecta
+4. `test_daily_loss_counts_only_utc_today` — solo pérdidas de hoy UTC
+5. `test_consecutive_loss_filter_unchanged_by_utc_migration` — TIE invisible preservado
+6. `test_max_trades_filter_uses_utc` — conteo de trades usa UTC
+
+### Hallazgos paralelos
+- Contaminación dataset ML: 2 trades no-OTC (`EURJPY-op` id=421, `BXY` id=422). Input para Tarea 1.7.
+
+---
+
 ## Tarea 0.6 — Deprecación dura de trader/paper_trader/ai_brain (2026-04-30)
 
 ### Razón

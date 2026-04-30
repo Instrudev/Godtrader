@@ -64,7 +64,8 @@ def _make_df(n: int = 100, seed: int = 1) -> pd.DataFrame:
 
 
 def _trade(result: str, today: bool = True) -> dict:
-    ts = date.today().isoformat() if today else "2020-01-01"
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d") if today else "2020-01-01"
     return {"result": result, "timestamp": ts + "T10:00:00", "op": "CALL"}
 
 
@@ -312,7 +313,9 @@ def test_max_trades_old_trades_not_counted() -> None:
 
 def test_max_trades_pending_not_counted() -> None:
     """Trades PENDING no cuentan (aún no han cerrado)."""
-    log = [{"result": "PENDING", "timestamp": date.today().isoformat() + "T10:00:00"}] * 5
+    from datetime import datetime, timezone
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    log = [{"result": "PENDING", "timestamp": today_utc + "T10:00:00"}] * 5
     result = max_trades_filter(log, max_trades=5)
     assert result.allow is True
 
@@ -400,3 +403,95 @@ def test_calculate_atr_higher_volatility_higher_atr() -> None:
     atr_calm     = _calculate_atr(df_calm,     period=14).iloc[-1]
     atr_volatile = _calculate_atr(df_volatile, period=14).iloc[-1]
     assert atr_volatile > atr_calm
+
+
+# ─── Tarea 1.1: UTC migration tests ─────────────────────────────────────────
+
+def test_today_utc_helper_returns_iso_format() -> None:
+    """_today_utc() retorna YYYY-MM-DD sin hora ni timezone."""
+    from regime_filter import _today_utc
+    from unittest.mock import patch
+    from datetime import datetime, timezone
+
+    fixed = datetime(2026, 4, 30, 14, 23, 45, tzinfo=timezone.utc)
+    with patch("regime_filter.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        result = _today_utc()
+
+    assert result == "2026-04-30"
+    assert "T" not in result
+    assert "+" not in result
+
+
+def test_daily_loss_resets_at_utc_midnight() -> None:
+    """Trades a las 23:55 UTC y 00:05 UTC del día siguiente cuentan como días distintos."""
+    log = [
+        {"result": "LOSS", "timestamp": "2026-04-29T23:55:00"},
+        {"result": "LOSS", "timestamp": "2026-04-29T23:56:00"},
+        {"result": "LOSS", "timestamp": "2026-04-29T23:57:00"},  # 3 losses el 29
+        {"result": "LOSS", "timestamp": "2026-04-30T00:05:00"},  # 1 loss el 30
+    ]
+    with patch("regime_filter._today_utc", return_value="2026-04-30"):
+        result = daily_loss_filter(log, max_daily_losses=3)
+    # Solo 1 loss "hoy" (30 abr) → no debe bloquear
+    assert result.allow is True
+
+
+def test_daily_loss_uses_utc_not_local_timezone() -> None:
+    """Simula servidor en UTC-5: medianoche local (05:00 UTC) no resetea el contador."""
+    # Escenario: servidor en UTC-5. Son las 00:30 local = 05:30 UTC.
+    # Hay 3 losses a las 04:00, 04:30, 05:00 UTC (todas del mismo día UTC: 30 abr).
+    log = [
+        {"result": "LOSS", "timestamp": "2026-04-30T04:00:00"},
+        {"result": "LOSS", "timestamp": "2026-04-30T04:30:00"},
+        {"result": "LOSS", "timestamp": "2026-04-30T05:00:00"},
+    ]
+    # _today_utc devuelve fecha UTC real (30 abr), no fecha local
+    with patch("regime_filter._today_utc", return_value="2026-04-30"):
+        result = daily_loss_filter(log, max_daily_losses=3)
+    # 3 losses hoy UTC → debe bloquear
+    assert result.allow is False
+    assert result.auto_shutdown is True
+
+
+def test_daily_loss_counts_only_utc_today() -> None:
+    """Solo las pérdidas con timestamp de hoy UTC se cuentan."""
+    log = [
+        {"result": "LOSS", "timestamp": "2026-04-28T12:00:00"},  # hace 2 días
+        {"result": "LOSS", "timestamp": "2026-04-29T12:00:00"},  # ayer
+        {"result": "LOSS", "timestamp": "2026-04-30T12:00:00"},  # hoy
+        {"result": "LOSS", "timestamp": "2026-04-30T13:00:00"},  # hoy
+    ]
+    with patch("regime_filter._today_utc", return_value="2026-04-30"):
+        result = daily_loss_filter(log, max_daily_losses=3)
+    # Solo 2 losses hoy → no bloquea
+    assert result.allow is True
+
+
+def test_consecutive_loss_filter_unchanged_by_utc_migration() -> None:
+    """consecutive_loss_filter NO usa fecha — no debe verse afectado por migración UTC.
+    TIE sigue siendo invisible (política actual, cambia en Tarea 1.3)."""
+    log = [
+        _trade("WIN"),
+        _trade("LOSS"),
+        _trade("TIE"),   # invisible para consecutive
+        _trade("LOSS"),
+        _trade("LOSS"),
+    ]
+    result = consecutive_loss_filter(log, max_consecutive=3)
+    # TIE invisible: LOSS-TIE-LOSS-LOSS = 3 consecutivas (TIE descartado)
+    assert result.allow is False
+    assert result.auto_shutdown is True
+
+
+def test_max_trades_filter_uses_utc() -> None:
+    """max_trades_filter usa _today_utc(), no date.today()."""
+    log = [
+        {"result": "WIN", "timestamp": "2026-04-29T23:50:00"},   # ayer UTC
+        {"result": "WIN", "timestamp": "2026-04-30T00:10:00"},   # hoy UTC
+    ]
+    with patch("regime_filter._today_utc", return_value="2026-04-30"):
+        result = max_trades_filter(log, max_trades=2)
+    # Solo 1 trade hoy UTC → no bloquea
+    assert result.allow is True
