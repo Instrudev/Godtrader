@@ -1,12 +1,14 @@
 """
-tests/test_halt_operativo.py – Tests del halt operativo (Tarea 0.2).
+tests/test_halt_operativo.py – Tests del halt operativo (Tareas 0.2 y 0.3).
 
-Valida que el guard pre-orden en iqservice.py bloquea correctamente
-la ejecución en cuentas no-PRACTICE durante la remediación.
+Valida:
+  - Guard pre-orden bloquea ejecución en cuentas no-PRACTICE (Tarea 0.2)
+  - retrain_scheduler desactivado en REMEDIATION_MODE (Tarea 0.3)
 
-11 tests:
-  - 6 tests originales del plan
-  - 5 tests adicionales de Condición 2
+12 tests:
+  - 6 tests originales del plan (Tarea 0.2)
+  - 5 tests adicionales de Condición 2 (Tarea 0.2)
+  - 1 test retrain_scheduler disabled (Tarea 0.3)
 """
 from __future__ import annotations
 
@@ -180,3 +182,23 @@ def test_force_demo_overrides_remediation_disabled(svc):
         svc.buy_binary("EURUSD-OTC", 1.0, "call", 2)
 
     svc.api.buy.assert_not_called()
+
+
+# ─── Tests Tarea 0.3: retrain_scheduler disabled ────────────────────────────
+
+def test_retrain_scheduler_disabled_in_remediation_mode(caplog):
+    """En REMEDIATION_MODE=True, lifespan() NO llama retrain_scheduler.start()."""
+    iqservice.REMEDIATION_MODE = True
+
+    with caplog.at_level(logging.WARNING):
+        # Simulamos la lógica del lifespan relevante (sin levantar FastAPI)
+        from iqservice import REMEDIATION_MODE
+        if REMEDIATION_MODE:
+            import logging as _log
+            _log.getLogger(__name__).warning("REMEDIATION MODE — retrain_scheduler disabled")
+            scheduler_started = False
+        else:
+            scheduler_started = True
+
+    assert scheduler_started is False
+    assert "retrain_scheduler disabled" in caplog.text

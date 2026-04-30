@@ -11,6 +11,38 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 0.3 — Auditoría de componentes no documentados (2026-04-30)
+
+### retrain_scheduler.py
+- **Estado**: Estaba activo dentro de `main.py --mode paper` (PID 23441). Nunca completó un ciclo de reentrenamiento (`retrain_state.json` no existe, `models/versions/` vacío).
+- **Acción**: Desactivado durante remediación. En `main.py`, si `REMEDIATION_MODE=True`, no se invoca `retrain_scheduler.start()`.
+- **Riesgo detectado**: `fetch_training_data()` no filtra por OTC — incluiría trades no-OTC si existieran.
+
+### ai_brain.py (LLM fallback)
+- **Uso**: Solo invocado por `trader.py` (bot single-asset) cuando ML no está cargado.
+- **No usado por** `asset_scanner.py` (motor principal). El scanner requiere ML obligatoriamente.
+- **Estado**: Legacy. No afecta operaciones actuales.
+
+### paper_trader.py vs asset_scanner.py
+- Pipelines de decisión divergentes: scanner usa cascada de 4 estrategias + ML obligatorio (55%), trader usa ML/LLM con doble gate (78%).
+- `asset_scanner` es el motor principal en uso.
+- **Decisión de deprecación**: Pendiente de aprobación (Opción 1 recomendada).
+
+### strategy_config.yaml
+- Umbrales catalogados. BB 2-Candle hardcodeado en `indicators.py`, no en YAML.
+- Cambios para Tarea 2.2 requieren edición en **ambos** (YAML y código).
+
+### min_streak_filter
+- Solo aplica cuando `is_extreme=True` — no afecta señales de BB o RSI clásico.
+- Redundancia parcial con `pre_qualify()` (2 velas mínimo vs 3 en filtro). Consolidar en Tarea 2.2.
+
+### Proceso bot
+- PID 23441 (`main.py --mode paper`): detenido (auto-shutdown o cierre manual).
+- 118 trades generados (2026-04-23 a 2026-04-30). Distribución: 59W / 55L / 3T / 1P.
+- Modelo ML verificado sin modificación post-shutdown (hash = baseline `f1709cb4...`).
+
+---
+
 ## Tarea 0.5 — Baseline auditable del modelo ML (2026-04-30)
 
 Snapshot inmutable del modelo en producción creado en `models/audit_baseline/`.

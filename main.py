@@ -72,7 +72,9 @@ async def lifespan(app: FastAPI):
             "═══ REMEDIATION MODE — DEMO ONLY ═══ "
             f"(FORCE_DEMO_ACCOUNT={FORCE_DEMO_ACCOUNT})"
         )
-    await retrain_scheduler.start()
+        logger.warning("REMEDIATION MODE — retrain_scheduler disabled")
+    else:
+        await retrain_scheduler.start()
     yield
     # Shutdown
     logger.info("Deteniendo el servidor y garantizando la desocupación del puerto...")
