@@ -66,6 +66,12 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    from iqservice import REMEDIATION_MODE, FORCE_DEMO_ACCOUNT
+    if REMEDIATION_MODE:
+        logger.warning(
+            "═══ REMEDIATION MODE — DEMO ONLY ═══ "
+            f"(FORCE_DEMO_ACCOUNT={FORCE_DEMO_ACCOUNT})"
+        )
     await retrain_scheduler.start()
     yield
     # Shutdown
