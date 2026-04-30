@@ -11,6 +11,42 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 2.4 — Desactivar filtros dinámicos de winrate (curve-fitting eliminado) (2026-04-30)
+
+### Problema
+`hour_profile_filter` y `weekday_profile_filter` usaban winrate acumulado de TODO el historial. Esto es curve-fitting retrospectivo: horas/días que perdieron en datos iniciales limitados quedan permanentemente bloqueadas.
+
+### Decisión: desactivar con flag, no reimplementar
+Walk-forward requiere ≥90 días de datos (≥3 bloques mensuales). Actualmente hay 7 días. Implementar lógica que no se usará por 90 días es ingeniería especulativa.
+
+### Implementación
+- `WALKFORWARD_ENABLED = False` en `regime_filter.py` con warning explícito contra activación sin implementar walk-forward.
+- `hour_profile_filter`: early return `FilterResult.ok()` cuando `WALKFORWARD_ENABLED=False`.
+- `weekday_profile_filter`: idem.
+- Funciones preservadas para futura implementación de walk-forward real.
+
+### Bug documentado (no corregido — irrelevante con filtros desactivados)
+`MIN_WINRATE_DATA_FLOOR = 10` se pasa como parámetro `data_floor` pero **nunca se evalúa** en la función. El filtro real era ≥5 (hardcodeado en SQL de `database.py`). A corregir cuando se implemente walk-forward.
+
+### Protección vigente sin estos filtros
+- `bb_slope_filter` (Tarea 2.5): protege contra tendencias fuertes.
+- `per_asset_loss_filter` (Tarea 1.2): 2 losses/activo → bloqueo.
+- `daily_loss_filter` (Tarea 1.2): 4 globales → halt.
+- `consecutive_loss_filter` (Tarea 1.3): 3 racha → halt.
+
+### Especificación walk-forward para tarea futura (3.x/4.x)
+- Dividir histórico en bloques mensuales no solapados.
+- Para cada hora/día, calcular winrate en cada bloque.
+- Solo permitir horas/días con WR ≥ 55% en TODOS los últimos 3 bloques consecutivos.
+- Recalcular al inicio de cada mes UTC.
+- Criterio de activación: ≥90 días de datos post-remediación.
+
+### Tests
+- 2 tests existentes adaptados (esperaban bloqueo → ahora allow).
+- 4 tests nuevos: disabled/enabled flag, constant verification.
+
+---
+
 ## Tarea 2.3 — Validar Estrategia 2 BB Body con espejo CALL (2026-04-30)
 
 ### Hallazgos

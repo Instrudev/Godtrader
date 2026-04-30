@@ -42,6 +42,12 @@ logger = logging.getLogger(__name__)
 MIN_WINRATE_HOURLY     = 0.55
 MIN_WINRATE_WEEKDAY    = 0.55
 MIN_WINRATE_DATA_FLOOR = 10     # trades mínimos históricos para aplicar filtro
+# WARNING: Setting WALKFORWARD_ENABLED to True without implementing walk-forward
+# logic (see CHANGELOG_REMEDIATION.md "Walk-forward specification") will REVERT
+# to curve-fitting behavior. The original hour_profile_filter and
+# weekday_profile_filter were curve-fitting risks. Do NOT enable until
+# walk-forward logic is properly implemented and validated with 90+ days of data.
+WALKFORWARD_ENABLED: bool = False  # True cuando walk-forward esté implementado
 ATR_PERIOD             = 14
 ATR_PERCENTILE_LOW     = 30     # bloquear si ATR está por debajo de este percentil
 ATR_PERCENTILE_HIGH    = 95     # bloquear si ATR está por encima de este percentil
@@ -102,11 +108,16 @@ def hour_profile_filter(
     Bloquea operaciones en franjas horarias donde el winrate histórico
     del activo sea menor al umbral mínimo.
 
-    Pasa automáticamente si no hay suficiente data histórica (fail-open).
+    DESACTIVADO cuando WALKFORWARD_ENABLED=False (remediación).
+    La lógica actual es curve-fitting retrospectivo — será reemplazada
+    por walk-forward validado cuando haya 90+ días de datos.
     """
+    if not WALKFORWARD_ENABLED:
+        return FilterResult.ok()  # Desactivado: curve-fitting eliminado
+
     hourly = get_winrate_by_hour(asset=asset)
     if hour_utc not in hourly:
-        return FilterResult.ok()   # sin datos suficientes → no bloquear
+        return FilterResult.ok()
 
     wr = hourly[hour_utc]
     if wr < min_winrate:
@@ -126,10 +137,15 @@ def weekday_profile_filter(
 ) -> FilterResult:
     """
     Bloquea operaciones en días de semana con winrate histórico bajo.
-    Aplica a sábado/domingo (OTC opera 24/7) donde el comportamiento suele diferir.
+
+    DESACTIVADO cuando WALKFORWARD_ENABLED=False (remediación).
+    Será reemplazado por walk-forward cuando haya 90+ días de datos.
 
     weekday: 0=lunes … 6=domingo
     """
+    if not WALKFORWARD_ENABLED:
+        return FilterResult.ok()  # Desactivado: curve-fitting eliminado
+
     by_day = get_winrate_by_weekday(asset=asset)
     if weekday not in by_day:
         return FilterResult.ok()

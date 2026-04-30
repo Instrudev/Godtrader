@@ -105,12 +105,12 @@ def test_hour_filter_good_winrate_allows() -> None:
     assert result.allow is True
 
 
-def test_hour_filter_bad_winrate_blocks() -> None:
-    with patch("regime_filter.get_winrate_by_hour", return_value={10: 0.45}):
+def test_hour_filter_bad_winrate_disabled_when_walkforward_off() -> None:
+    """With WALKFORWARD_ENABLED=False, bad winrate does NOT block (curve-fitting eliminated)."""
+    with patch("regime_filter.WALKFORWARD_ENABLED", False), \
+         patch("regime_filter.get_winrate_by_hour", return_value={10: 0.45}):
         result = hour_profile_filter(hour_utc=10, asset="EURUSD-OTC", min_winrate=0.52)
-    assert result.allow is False
-    assert result.filter_name == "hour_profile_filter"
-    assert result.auto_shutdown is False
+    assert result.allow is True  # disabled → always allow
 
 
 def test_hour_filter_exactly_at_threshold_allows() -> None:
@@ -133,11 +133,12 @@ def test_weekday_filter_no_data_allows() -> None:
     assert result.allow is True
 
 
-def test_weekday_filter_saturday_low_winrate_blocks() -> None:
-    with patch("regime_filter.get_winrate_by_weekday", return_value={5: 0.45}):
+def test_weekday_filter_saturday_disabled_when_walkforward_off() -> None:
+    """With WALKFORWARD_ENABLED=False, Saturday low winrate does NOT block."""
+    with patch("regime_filter.WALKFORWARD_ENABLED", False), \
+         patch("regime_filter.get_winrate_by_weekday", return_value={5: 0.45}):
         result = weekday_profile_filter(weekday=5, min_winrate=0.52)
-    assert result.allow is False
-    assert "Sábado" in result.reason
+    assert result.allow is True  # disabled → always allow
 
 
 def test_weekday_filter_sunday_good_winrate_allows() -> None:
@@ -737,3 +738,36 @@ def test_bb_slope_insufficient_history_allows() -> None:
     df = _make_slope_df([1.1000, 1.1010])[:4]  # solo 4 velas
     result = bb_slope_filter(df, direction="CALL", threshold_pct=0.08)
     assert result.allow is True  # fail-open
+
+
+# ─── Tarea 2.4: Walk-forward flag ────────────────────────────────────────────
+
+def test_hour_profile_disabled_when_walkforward_off() -> None:
+    """WALKFORWARD_ENABLED=False → hour_profile_filter always allows."""
+    with patch("regime_filter.WALKFORWARD_ENABLED", False), \
+         patch("regime_filter.get_winrate_by_hour", return_value={10: 0.20}):
+        result = hour_profile_filter(hour_utc=10, min_winrate=0.55)
+    assert result.allow is True
+
+
+def test_weekday_profile_disabled_when_walkforward_off() -> None:
+    """WALKFORWARD_ENABLED=False → weekday_profile_filter always allows."""
+    with patch("regime_filter.WALKFORWARD_ENABLED", False), \
+         patch("regime_filter.get_winrate_by_weekday", return_value={5: 0.10}):
+        result = weekday_profile_filter(weekday=5, min_winrate=0.55)
+    assert result.allow is True
+
+
+def test_hour_profile_active_when_walkforward_on() -> None:
+    """WALKFORWARD_ENABLED=True → hour_profile_filter blocks bad winrate."""
+    with patch("regime_filter.WALKFORWARD_ENABLED", True), \
+         patch("regime_filter.get_winrate_by_hour", return_value={10: 0.40}):
+        result = hour_profile_filter(hour_utc=10, min_winrate=0.55)
+    assert result.allow is False
+    assert result.filter_name == "hour_profile_filter"
+
+
+def test_walkforward_enabled_constant_is_false() -> None:
+    """WALKFORWARD_ENABLED default es False durante remediación."""
+    from regime_filter import WALKFORWARD_ENABLED
+    assert WALKFORWARD_ENABLED is False
