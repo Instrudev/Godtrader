@@ -1,5 +1,16 @@
 # Changelog — Branch remediation/v1
 
+## Tests pre-existentes con fallo conocido
+
+Ver `KNOWN_ISSUES.md` para detalle completo. 3 tests excluidos de la métrica de remediación:
+- `test_measure_streaks_ignores_doji` (bug en streaks, severidad baja)
+- `test_classifier_no_model_returns_neutral` (auto-carga oculta de ML, auditar en Tarea 1.5)
+- `test_classifier_predict_proba_from_df_no_model` (idem)
+
+Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adicional es regresión.
+
+---
+
 ## Tarea 0.2 — Halt Operativo (2026-04-30)
 
 ### Cambios
