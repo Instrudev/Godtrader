@@ -403,19 +403,19 @@ def pre_qualify_classical(df: pd.DataFrame) -> Tuple[bool, str]:
     bb_lower = float(last["bb_lower"])
     vol_rel  = float(last.get("vol_rel", 1.0))
 
-    rsi_extreme = rsi < 35 or rsi > 65
+    rsi_extreme = rsi < 30 or rsi > 70
     bb_range    = bb_upper - bb_lower
     pct_b       = (price - bb_lower) / bb_range if bb_range > 1e-10 else 0.5
     bb_touch    = pct_b <= 0.15 or pct_b >= 0.85
 
     if rsi_extreme and bb_touch:
-        rsi_label = "SOBREVENDIDO" if rsi < 35 else "SOBRECOMPRADO"
+        rsi_label = "SOBREVENDIDO" if rsi < 30 else "SOBRECOMPRADO"
         bb_label  = "ZONA_INF" if pct_b <= 0.15 else "ZONA_SUP"
         return True, f"[clásico] RSI {rsi:.1f} ({rsi_label}) + {bb_label} | VolRel={vol_rel:.2f}x"
 
     reasons = []
     if not rsi_extreme:
-        reasons.append(f"RSI {rsi:.1f} [neutral 35-65]")
+        reasons.append(f"RSI {rsi:.1f} [neutral 30-70]")
     if not bb_touch:
         reasons.append(f"precio central (pct_b={pct_b:.2f})")
     return False, " / ".join(reasons)
@@ -510,12 +510,13 @@ def detect_bb_two_candle_reversal(df: pd.DataFrame) -> Tuple[bool, Optional[str]
 
 def detect_bb_body_reversal(df: pd.DataFrame) -> Tuple[bool, str]:
     """
-    Señal PUT de reversión: vela verde con bb_mid en el 10% inferior del cuerpo
-    (o por debajo). Indica que el precio se extendió sobre la media → presión bajista.
+    Señal PUT de reversión: vela verde con bb_upper en el 10% inferior del cuerpo
+    (o por debajo). Indica que el precio rompió la banda superior → sobreextensión
+    extrema y presión bajista inminente.
 
-    Condición principal (Opción A):
+    Condición principal:
         close > open  (vela verde)
-        bb_mid ≤ open + (close - open) * 0.10
+        bb_upper ≤ open + (close - open) * 0.10
 
     Filtros de precisión:
         RSI > 55        → confirma sobreextensión real
@@ -528,7 +529,7 @@ def detect_bb_body_reversal(df: pd.DataFrame) -> Tuple[bool, str]:
     last     = df.iloc[-1]
     open_    = float(last["open"])
     close    = float(last["close"])
-    bb_mid   = float(last["bb_mid"])
+    bb_upper = float(last["bb_upper"])
     bb_width = float(last["bb_width"])
     rsi      = float(last["rsi"])
     vol_rel  = float(last.get("vol_rel", 1.0))
@@ -538,8 +539,8 @@ def detect_bb_body_reversal(df: pd.DataFrame) -> Tuple[bool, str]:
         return False, "Vela no es alcista"
 
     threshold = open_ + body * 0.10
-    if bb_mid > threshold:
-        return False, f"bb_mid al {(bb_mid - open_) / body * 100:.0f}% del cuerpo (necesita ≤10%)"
+    if bb_upper > threshold:
+        return False, f"bb_upper al {(bb_upper - open_) / body * 100:.0f}% del cuerpo (necesita ≤10%)"
 
     if rsi <= 55:
         return False, f"RSI {rsi:.1f} ≤ 55 (sin sobreextensión)"
@@ -550,9 +551,9 @@ def detect_bb_body_reversal(df: pd.DataFrame) -> Tuple[bool, str]:
     if vol_rel < 1.0:
         return False, f"VolRel {vol_rel:.2f}x < 1.0 (volumen insuficiente)"
 
-    ext_pct = (threshold - bb_mid) / body * 100
+    ext_pct = (threshold - bb_upper) / body * 100
     return True, (
-        f"[bb_body_reversal] Vela verde extendida sobre BB-Mid "
+        f"[bb_body_reversal] Vela verde rompió BB-Upper "
         f"(ext={ext_pct:.0f}% sobre umbral) | RSI={rsi:.1f} | "
         f"BB-W={bb_width:.3f}% | VolRel={vol_rel:.2f}x"
     )

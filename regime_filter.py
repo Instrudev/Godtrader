@@ -36,10 +36,8 @@ logger = logging.getLogger(__name__)
 
 # ─── Umbrales por defecto (todos configurables) ────────────────────────────────
 
-# MIN_WINRATE_HOURLY     = 0.52   # umbral original (restaurar cuando haya ≥50 trades)
-# MIN_WINRATE_WEEKDAY    = 0.52   # umbral original (restaurar cuando haya ≥50 trades)
-MIN_WINRATE_HOURLY     = 0.39   # umbral reducido mientras se acumulan datos (< 50 trades)
-MIN_WINRATE_WEEKDAY    = 0.39   # umbral reducido mientras se acumulan datos (< 50 trades)
+MIN_WINRATE_HOURLY     = 0.52   # umbral restaurado (≥50 trades acumulados)
+MIN_WINRATE_WEEKDAY    = 0.52   # umbral restaurado (≥50 trades acumulados)
 MIN_WINRATE_DATA_FLOOR = 10     # trades mínimos históricos para aplicar filtro
 ATR_PERIOD             = 14
 ATR_PERCENTILE_LOW     = 30     # bloquear si ATR está por debajo de este percentil
@@ -48,9 +46,14 @@ MIN_PAYOUT             = 0.80   # payout mínimo del par para operar
 MAX_DAILY_LOSSES       = 3      # pérdidas diarias máximas (auto-shutdown)
 MAX_CONSECUTIVE_LOSSES = 3      # pérdidas consecutivas máximas (auto-shutdown)
 MAX_TRADES_PER_DAY     = 15    # operaciones diarias máximas
-BLOCKED_HOURS          = frozenset({0, 1, 2, 3, 14})   # horas UTC con winrate < 40%
-BLOCKED_WEEKDAYS       = frozenset({1, 5})              # 1=Martes, 5=Sábado
-BLOCKED_ASSETS         = frozenset({"GBPUSD-OTC", "EURGBP-OTC"})  # winrate < 43%
+BLOCKED_HOURS          = frozenset()                           # vacío — datos insuficientes (n<30 por hora), dejar que hour_profile_filter decida dinámicamente
+BLOCKED_WEEKDAYS       = frozenset()                           # vacío — datos insuficientes, dejar que weekday_profile_filter decida dinámicamente
+BLOCKED_ASSETS         = frozenset({"GBPUSD-OTC", "EURGBP-OTC", "AUDCAD-OTC", "GBPJPY-OTC"})
+# Whitelist de subyacentes para opciones binarias — crypto/acciones/commodities dieron 0% WR
+ALLOWED_ASSETS         = frozenset({
+    "EURUSD-OTC", "USDJPY-OTC", "EURJPY-OTC", "USDCHF-OTC",
+    "EURCHF-OTC", "AUDUSD-OTC", "NZDUSD-OTC", "USDCAD-OTC",
+})
 MIN_STREAK_LENGTH      = 3     # rachas de 1-2 velas no tienen edge
 LOSS_PATTERN_DAYS      = 7     # días hacia atrás para buscar patrones de pérdida
 LOSS_PATTERN_MIN_COUNT = 3     # mínimo de pérdidas similares para bloquear
@@ -329,11 +332,16 @@ def blocked_weekday_filter(weekday: int) -> FilterResult:
 
 
 def blocked_asset_filter(asset: str) -> FilterResult:
-    """Bloquea activos con winrate históricamente < 43%."""
+    """Bloquea activos en blacklist o fuera del whitelist de forex OTC."""
     if asset in BLOCKED_ASSETS:
         return FilterResult.block(
             "blocked_asset_filter",
             f"{asset} bloqueado (winrate histórico < 43%)",
+        )
+    if ALLOWED_ASSETS and asset not in ALLOWED_ASSETS:
+        return FilterResult.block(
+            "blocked_asset_filter",
+            f"{asset} no está en whitelist de forex OTC",
         )
     return FilterResult.ok()
 

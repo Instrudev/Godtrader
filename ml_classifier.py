@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import logging
 import pickle
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
 logger = logging.getLogger(__name__)
 

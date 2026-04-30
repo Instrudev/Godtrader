@@ -43,6 +43,7 @@ from indicators import (
 )
 from iqservice import iq_service
 from ml_classifier import ml_classifier, extract_features
+from regime_filter import check_all_filters
 
 logger = logging.getLogger(__name__)
 
@@ -50,13 +51,13 @@ logger = logging.getLogger(__name__)
 
 CANDLE_INTERVAL     = 60    # segundos por vela
 HISTORY_COUNT       = 300   # velas a solicitar por activo
-MIN_PROBABILITY     = 55    # umbral ML — activo solo cuando ML_MIN_TRADES está cubierto
+MIN_PROBABILITY     = 55    # restaurado — con payout 83%, breakeven es 54.7%
 ML_MIN_TRADES       = 150   # trades cerrados mínimos para que el ML sea confiable
 REQUEST_DELAY       = 0.5   # delay entre requests al broker (reducido para acelerar scan)
 SCAN_EXTRA_SECS     = 1     # segundos extra tras cierre para que el dato esté disponible
 MAX_CONSEC_ERRORS   = 2     # errores consecutivos antes de abortar el scan
 GET_CANDLES_TIMEOUT = 7.0   # segundos máx por llamada — evita bloqueo indefinido del WS
-MAX_ASSETS_PER_SCAN = 20    # máximo de activos escaneados por ciclo (rota aleatoriamente)
+MAX_ASSETS_PER_SCAN = 25    # máximo de activos escaneados por ciclo (rota aleatoriamente)
 MAX_ENTRY_SECS      = 15    # segundos máx desde inicio de vela para entrar — evita entrar a destiempo
 PRE_SCAN_SECS       = 15    # segundos ANTES del cierre de vela para iniciar pre-scan
 MAX_HOT_CANDIDATES  = 5     # candidatos calientes a re-verificar tras cierre
@@ -377,11 +378,15 @@ class AssetScanner:
         """
         try:
             all_assets = iq_service.get_assets()
-            # Filtra por tipo (binary o turbo) y estado abierto — no por nombre
-            open_assets = [
-                a["name"] for a in all_assets
-                if a.get("open") and a.get("type") in ("binary", "turbo")
-            ]
+            # Filtra por tipo (binary o turbo) y estado abierto — dedup por nombre
+            seen = set()
+            open_assets = []
+            for a in all_assets:
+                if a.get("open") and a.get("type") in ("binary", "turbo"):
+                    name = a["name"]
+                    if name not in seen:
+                        seen.add(name)
+                        open_assets.append(name)
 
             if self.assets:
                 # Intersectar la lista del usuario con los que están abiertos
@@ -413,7 +418,8 @@ class AssetScanner:
         """
         1. Consulta al broker qué activos OTC están abiertos ahora
         2. Solo escanea esos — nunca activos cerrados o inexistentes
-        3. Escanea en paralelo (máx 5 hilos) para terminar rápido
+        3. Escanea en paralelo (máx 3 hilos) para no colapsar el WS
+        4. Si > 50% de los activos dan error de conexión, reconecta
         """
         candidates = self._get_available_assets()
 
@@ -422,7 +428,7 @@ class AssetScanner:
             return []
 
         results = []
-        with ThreadPoolExecutor(max_workers=5) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
             futures = {pool.submit(self._scan_one, asset): asset for asset in candidates}
             for future in futures:
                 if not self.running:
@@ -438,6 +444,21 @@ class AssetScanner:
                         "reason": f"timeout: {e}", "score": 0.0,
                         "df": None, "direction": None, "conn_error": True,
                     })
+
+        # Si muchos activos fallaron por conexión, intentar reconectar
+        conn_errors = sum(1 for r in results if r.get("conn_error"))
+        if conn_errors > len(results) * 0.5 and len(results) > 3:
+            logger.warning(
+                f"[SCANNER] {conn_errors}/{len(results)} errores de conexión. "
+                "Reconectando al broker..."
+            )
+            try:
+                if iq_service.is_connected():
+                    logger.info("[SCANNER] Reconexión exitosa tras errores masivos.")
+                else:
+                    logger.error("[SCANNER] Reconexión fallida.")
+            except Exception as e:
+                logger.error(f"[SCANNER] Error en reconexión: {e}")
 
         return results
 
@@ -523,17 +544,7 @@ class AssetScanner:
             logger.info(f"[SCANNER] {asset}: dirección indeterminada. Skip.")
             return False
 
-        # ── Filtro anti-repetición de pérdidas ───────────────────────────────
-        try:
-            from regime_filter import loss_pattern_filter
-            lp_result = loss_pattern_filter(df, asset, direction)
-            if not lp_result.allow:
-                logger.info(f"[SCANNER] {asset}: ✗ {lp_result.reason}")
-                return False
-        except Exception as e:
-            logger.debug(f"[SCANNER] loss_pattern_filter error: {e}")
-
-        # ── Contexto de mercado (siempre necesario para persistir) ────────────
+        # ── Contexto de mercado (siempre necesario para filtros y persistir) ──
         try:
             last      = df.iloc[-1]
             ts_time   = last["time"]
@@ -547,47 +558,48 @@ class AssetScanner:
             logger.warning(f"[SCANNER] {asset}: error contexto → {e}")
             return False
 
-        # ── Validación ML (solo si hay datos suficientes) ─────────────────────
-        proba  = 0.5   # valor por defecto cuando el ML no está listo
-        pr_pct = 50
+        # ── Filtros de régimen OTC (todos) ───────────────────────────────────
+        regime = check_all_filters(
+            df=df,
+            asset=asset,
+            trade_log=self.trade_log,
+            payout=payout,
+            direction=direction,
+        )
+        if not regime.allow:
+            logger.info(f"[SCANNER] {asset}: ✗ {regime.filter_name}: {regime.reason}")
+            if regime.auto_shutdown:
+                logger.warning(f"[SCANNER][AUTOSHUTDOWN] {regime.reason}")
+                self._notify("BOT_AUTOSHUTDOWN", regime.reason, data={"filter": regime.filter_name})
+                self.running = False
+            return False
 
-        try:
-            from database import fetch_trades
-            closed_count = len([
-                t for t in fetch_trades(limit=9999, path=DB_PATH)
-                if t.get("result") in ("WIN", "LOSS")
-            ])
-        except Exception:
-            closed_count = 0
-
-        ml_active = ml_classifier.is_loaded() and closed_count >= ML_MIN_TRADES
-
-        if ml_active:
-            try:
-                features  = extract_features(
-                    df, payout=payout, winrate_hour=winrate_hour, direction=direction, expiry_min=self.expiry_min
-                )
-                if features is None:
-                    logger.info(f"[SCANNER] {asset}: features None. Skip.")
-                    return False
-                probas    = ml_classifier.predict_proba(features)
-                proba_key = "call_proba" if direction == "CALL" else "put_proba"
-                proba     = probas.get(proba_key, 0.5)
-                pr_pct    = int(round(proba * 100))
-            except Exception as e:
-                logger.warning(f"[SCANNER] {asset}: error ML → {e}")
-
-            logger.info(
-                f"[SCANNER] {asset} | {direction} | ML proba={pr_pct}% | umbral={MIN_PROBABILITY}%"
+        # ── Validación ML (obligatoria — no se opera sin modelo) ─────────────
+        if not ml_classifier.is_loaded():
+            logger.warning(
+                f"[SCANNER] {asset}: modelo ML no cargado. No se opera sin ML."
             )
-            if pr_pct < MIN_PROBABILITY:
-                logger.info(f"[SCANNER] {asset}: rechazado por ML ({pr_pct}% < {MIN_PROBABILITY}%)")
-                return False
-        else:
-            logger.info(
-                f"[SCANNER] {asset} | {direction} | "
-                f"ML en modo recolección ({closed_count}/{ML_MIN_TRADES} trades) — ejecutando por estrategia pura"
-            )
+            return False
+
+        features = extract_features(
+            df, payout=payout, winrate_hour=winrate_hour,
+            direction=direction, expiry_min=self.expiry_min,
+        )
+        if features is None:
+            logger.info(f"[SCANNER] {asset}: features None. Skip.")
+            return False
+
+        probas    = ml_classifier.predict_proba(features)
+        proba_key = "call_proba" if direction == "CALL" else "put_proba"
+        proba     = probas.get(proba_key, 0.5)
+        pr_pct    = int(round(proba * 100))
+
+        logger.info(
+            f"[SCANNER] {asset} | {direction} | ML proba={pr_pct}% | umbral={MIN_PROBABILITY}%"
+        )
+        if pr_pct < MIN_PROBABILITY:
+            logger.info(f"[SCANNER] {asset}: rechazado por ML ({pr_pct}% < {MIN_PROBABILITY}%)")
+            return False
 
         # ── Guardia de tiempo: no entrar si ya pasaron muchos segundos de la vela ─
         secs_into_candle = time.time() % CANDLE_INTERVAL
@@ -955,9 +967,9 @@ def _infer_direction(df: pd.DataFrame) -> Optional[str]:
         return "CALL" if streak["direction"] == "bear" else "PUT"
 
     # 3. RSI clásico
-    if rsi < 35:
+    if rsi < 30:
         return "CALL"
-    if rsi > 65:
+    if rsi > 70:
         return "PUT"
 
     return None
@@ -996,8 +1008,8 @@ def _score_signal(df: pd.DataFrame) -> float:
     body = price - open_
     if body > 0:
         threshold = open_ + body * 0.10
-        if bb_mid <= threshold:
-            ext   = min((threshold - bb_mid) / body, 1.0)
+        if bb_up <= threshold:
+            ext   = min((threshold - bb_up) / body, 1.0)
             rsi_f = max(0.0, (rsi - 55) / 45)
             vol_f = min(max(vol_rel - 1.0, 0.0), 1.0) * 0.10
             score = max(score, 0.50 + ext * 0.28 + rsi_f * 0.15 + vol_f)
@@ -1011,12 +1023,12 @@ def _score_signal(df: pd.DataFrame) -> float:
 
     # ── RSI clásico + BB ──────────────────────────────────────────────────────
     pct_b = (price - bb_low) / bb_rng if bb_rng > 1e-10 else 0.5
-    if rsi < 35:
-        rsi_f = (35 - rsi) / 35
+    if rsi < 30:
+        rsi_f = (30 - rsi) / 30
         bb_f  = max(0.0, 0.20 - pct_b) / 0.20
         score = max(score, 0.40 + rsi_f * 0.30 + bb_f * 0.30)
-    elif rsi > 65:
-        rsi_f = (rsi - 65) / 35
+    elif rsi > 70:
+        rsi_f = (rsi - 70) / 30
         bb_f  = max(0.0, pct_b - 0.80) / 0.20
         score = max(score, 0.40 + rsi_f * 0.30 + bb_f * 0.30)
 

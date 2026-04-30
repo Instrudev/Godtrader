@@ -211,8 +211,10 @@ def test_features_to_array_missing_key_defaults_zero() -> None:
 
 # ─── MLClassifier sin modelo ─────────────────────────────────────────────────
 
-def test_classifier_no_model_returns_neutral() -> None:
+def test_classifier_no_model_returns_neutral(tmp_path) -> None:
     clf = MLClassifier()
+    # Forzar carga desde path inexistente para simular ausencia de modelo
+    clf.load(model_path=tmp_path / "no.pkl", calib_path=tmp_path / "no.pkl")
     feat = {col: 0.0 for col in FEATURE_COLS}
     result = clf.predict_proba(feat)
     assert result == _NEUTRAL
@@ -233,8 +235,10 @@ def test_classifier_load_missing_file_returns_false(tmp_path) -> None:
     assert not clf.is_loaded()
 
 
-def test_classifier_predict_proba_from_df_no_model() -> None:
+def test_classifier_predict_proba_from_df_no_model(tmp_path) -> None:
     clf = MLClassifier()
+    # Forzar carga desde path inexistente para simular ausencia de modelo
+    clf.load(model_path=tmp_path / "no.pkl", calib_path=tmp_path / "no.pkl")
     df = _make_df()
     result = clf.predict_proba_from_df(df)
     assert result["call_proba"] == pytest.approx(0.5)

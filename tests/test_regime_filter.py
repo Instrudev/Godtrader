@@ -320,9 +320,9 @@ def test_max_trades_pending_not_counted() -> None:
 # ─── check_all_filters ────────────────────────────────────────────────────────
 
 def _safe_datetime():
-    """Devuelve un datetime en hora/día no bloqueados (Jueves 10:00 UTC)."""
+    """Devuelve un datetime en hora/día no bloqueados (Lunes 15:00 UTC)."""
     from datetime import datetime, timezone
-    return datetime(2026, 4, 30, 10, 0, 0, tzinfo=timezone.utc)  # Jueves 10h UTC
+    return datetime(2026, 4, 27, 15, 0, 0, tzinfo=timezone.utc)  # Lunes 15h UTC
 
 
 def test_check_all_filters_empty_passes() -> None:
@@ -344,7 +344,7 @@ def test_check_all_filters_blocks_on_consecutive_losses() -> None:
          patch("regime_filter.drift_filter", return_value=FilterResult.ok()), \
          patch("regime_filter.datetime") as mock_dt:
         mock_dt.now.return_value = _safe_datetime()
-        result = check_all_filters(df=df, asset="X", trade_log=log, payout=0.85, max_consecutive=3)
+        result = check_all_filters(df=df, asset="EURUSD-OTC", trade_log=log, payout=0.85, max_consecutive=3)
     assert result.allow is False
     assert result.auto_shutdown is True
 
@@ -356,7 +356,7 @@ def test_check_all_filters_blocks_on_low_payout() -> None:
          patch("regime_filter.drift_filter", return_value=FilterResult.ok()), \
          patch("regime_filter.datetime") as mock_dt:
         mock_dt.now.return_value = _safe_datetime()
-        result = check_all_filters(df=df, asset="X", trade_log=[], payout=0.60, min_payout=0.80)
+        result = check_all_filters(df=df, asset="EURUSD-OTC", trade_log=[], payout=0.60, min_payout=0.80)
     assert result.allow is False
     assert result.filter_name == "payout_filter"
 
@@ -370,7 +370,7 @@ def test_check_all_filters_returns_first_failure() -> None:
          patch("regime_filter.drift_filter", return_value=FilterResult.ok()), \
          patch("regime_filter.datetime") as mock_dt:
         mock_dt.now.return_value = _safe_datetime()
-        result = check_all_filters(df=df, asset="X", trade_log=log, payout=0.85,
+        result = check_all_filters(df=df, asset="EURUSD-OTC", trade_log=log, payout=0.85,
                                     max_daily_losses=3, max_consecutive=3)
     assert result.filter_name == "daily_loss_filter"
 
