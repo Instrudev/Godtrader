@@ -11,6 +11,45 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 1.0 — Integrar check_all_filters en asset_scanner (2026-04-30)
+
+### Hallazgo crítico (Escenario B)
+Durante la verificación de Tarea 1.2, se descubrió que `asset_scanner._try_execute()` **nunca llamaba `check_all_filters()`**. Solo usaba `loss_pattern_filter` (1 de 13 filtros). Los 78 trades ejecutados por el scanner operaron sin:
+- `daily_loss_filter` (stop loss diario)
+- `consecutive_loss_filter` (racha de pérdidas)
+- `blocked_hours_filter` / `blocked_weekday_filter`
+- `payout_filter` / `volatility_filter`
+- `hour_profile_filter` / `weekday_profile_filter`
+- `max_trades_filter` / `min_streak_filter` / `drift_filter`
+
+Esto explica parcialmente el winrate de ~50% observado en los trades del scanner.
+
+**Causa raíz:** El reporte de Tarea 0.1 fue incorrecto. La auditoría leyó el working directory con cambios pre-plan que integraban `check_all_filters`. Al revertir esos cambios, la integración desapareció. El código de `main` HEAD nunca la tuvo.
+
+### Cambios en `asset_scanner.py`
+- Import `check_all_filters` desde `regime_filter`.
+- Eliminar llamada individual a `loss_pattern_filter` (ahora absorbida como filtro #13 dentro de `check_all_filters`).
+- Mover cálculo de `payout` antes de filtros (requerido como parámetro de `check_all_filters`).
+- Insertar `check_all_filters(df, asset, trade_log, payout, direction)` con manejo de `auto_shutdown`.
+- Logging de cada filtro que bloquee y del auto-shutdown.
+
+### Verificación empírica del histórico
+- 0 combinaciones hour+asset con ≥10 trades → filtros dinámicos serán fail-open.
+- 3 combinaciones weekday+asset con ≥10 trades, todas WR > 0.55 → sin bloqueo erróneo.
+
+### Tests añadidos (6) — `tests/test_scanner_filters.py`
+1. `test_scanner_calls_check_all_filters` — se invoca con parámetros correctos
+2. `test_scanner_filter_blocks_before_ml` — ML no se invoca si filtro bloquea
+3. `test_scanner_filter_passes_allows_ml` — ML se invoca si filtro pasa
+4. `test_scanner_auto_shutdown_stops_scanner` — auto_shutdown setea running=False
+5. `test_scanner_no_double_loss_pattern` — loss_pattern_filter no se llama dos veces
+6. `test_scanner_payout_calculated_before_filters` — payout se calcula antes de filtros
+
+### Nota arquitectónica para Tarea 1.2
+El scanner tiene 3 checkpoints de loop donde evalúa `self.running`. Si `auto_shutdown` activa durante un ciclo, puede ejecutar operaciones adicionales antes de detectar el halt. Mitigación a evaluar en Tarea 1.2.
+
+---
+
 ## Tarea 1.1 — Migración Stop Loss y contadores diarios a UTC (2026-04-30)
 
 ### Scope original

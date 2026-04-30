@@ -43,6 +43,7 @@ from indicators import (
 )
 from iqservice import iq_service
 from ml_classifier import ml_classifier, extract_features
+from regime_filter import check_all_filters
 
 logger = logging.getLogger(__name__)
 
@@ -512,8 +513,16 @@ class AssetScanner:
 
     def _try_execute(self, candidate: Dict) -> bool:
         """
-        Valida con ML y ejecuta si supera el umbral.
+        Aplica filtros de régimen, valida con ML y ejecuta si supera el umbral.
         Devuelve True si se ejecutó el trade.
+
+        Flujo:
+          1. Direction check
+          2. Contexto de mercado (payout, hora, weekday)
+          3. check_all_filters (13 filtros de régimen)
+          4. ML validation
+          5. Guardia de tiempo
+          6. Ejecución
         """
         asset     = candidate["asset"]
         df        = candidate["df"]
@@ -523,17 +532,7 @@ class AssetScanner:
             logger.info(f"[SCANNER] {asset}: dirección indeterminada. Skip.")
             return False
 
-        # ── Filtro anti-repetición de pérdidas ───────────────────────────────
-        try:
-            from regime_filter import loss_pattern_filter
-            lp_result = loss_pattern_filter(df, asset, direction)
-            if not lp_result.allow:
-                logger.info(f"[SCANNER] {asset}: ✗ {lp_result.reason}")
-                return False
-        except Exception as e:
-            logger.debug(f"[SCANNER] loss_pattern_filter error: {e}")
-
-        # ── Contexto de mercado (siempre necesario para persistir) ────────────
+        # ── Contexto de mercado (requerido por filtros Y por persistencia) ────
         try:
             last      = df.iloc[-1]
             ts_time   = last["time"]
@@ -545,6 +544,22 @@ class AssetScanner:
             payout       = iq_service.get_payout(asset, self.asset_type) or 0.80
         except Exception as e:
             logger.warning(f"[SCANNER] {asset}: error contexto → {e}")
+            return False
+
+        # ── Filtros de régimen OTC (13 filtros via check_all_filters) ─────────
+        regime = check_all_filters(
+            df=df,
+            asset=asset,
+            trade_log=self.trade_log,
+            payout=payout,
+            direction=direction,
+        )
+        if not regime.allow:
+            logger.info(f"[SCANNER] {asset}: ✗ {regime.filter_name}: {regime.reason}")
+            if regime.auto_shutdown:
+                logger.warning(f"[SCANNER][AUTOSHUTDOWN] {regime.reason}")
+                self._notify("BOT_AUTOSHUTDOWN", regime.reason, data={"filter": regime.filter_name})
+                self.running = False
             return False
 
         # ── Validación ML (solo si hay datos suficientes) ─────────────────────
