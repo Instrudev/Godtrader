@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 REMEDIATION_MODE: bool = True       # True = branch de remediación activa
 FORCE_DEMO_ACCOUNT: bool = True     # True = bloquear ejecución en cuenta real
 ALLOWED_ACCOUNT_TYPES = {"PRACTICE"}  # Whitelist de tipos de cuenta permitidos
+ALLOW_DEPRECATED_TRADERS: bool = False  # True = permitir import de trader/paper_trader/ai_brain
 
 # ─── Logger de seguridad dedicado ────────────────────────────────────────────
 

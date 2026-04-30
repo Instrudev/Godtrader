@@ -11,6 +11,25 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 0.6 — Deprecación dura de trader/paper_trader/ai_brain (2026-04-30)
+
+### Razón
+- Pipelines paralelos con umbrales ML distintos (55% vs 78%).
+- ai_brain (LLM como gate de trading) arquitectónicamente cuestionable.
+- Carga de mantenimiento que duplicaría trabajo de remediación.
+
+### Mecanismo
+- `ALLOW_DEPRECATED_TRADERS = False` por defecto en `iqservice.py`.
+- Importación de `trader.py`, `paper_trader.py`, `ai_brain.py` lanza `ImportError` con instrucciones claras.
+- `DeprecationWarning` si la flag se activa explícitamente.
+- `main.py` usa `_DeprecatedBotStub` inerte cuando `REMEDIATION_MODE=True` (no rompe endpoints legacy).
+
+### Reversibilidad
+- Archivos preservados (no borrados).
+- Para reactivar: cambiar `ALLOW_DEPRECATED_TRADERS = True` en `iqservice.py` con justificación documentada.
+
+---
+
 ## Tarea 0.3 — Auditoría de componentes no documentados (2026-04-30)
 
 ### retrain_scheduler.py

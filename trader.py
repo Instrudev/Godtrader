@@ -1,19 +1,36 @@
 """
 trader.py – Orquestador del Bot de Trading Autónomo v3
-Motor de decisión primario: MLClassifier (LightGBM + Platt).
-Fallback: Ollama LLM (ai_brain.py) cuando no hay modelo ML entrenado.
 
-Flujo por ciclo (nueva vela de 60s):
-  1. Detectar cierre de vela nueva
-  2. Filtros de régimen OTC (regime_filter.py)
-  3. Filtro de pre-calificación OTC (pre_qualify: racha extrema o RSI+BB fallback)
-  4. Motor de decisión:
-       a) Si MLClassifier cargado: predict_proba(df) → call_proba / put_proba
-       b) Fallback: LLM (ai_brain.get_ai_decision) → pr / 100
-  5. Gatillo 1: proba >= MIN_PROBABILITY
-  6. Gatillo 2: dirección coherente con racha OTC
-  7. Si ambos superados: api.buy() → activar cooldown
+DEPRECATED: This module is deprecated as of remediation/v1.
+
+The official trading pipeline is asset_scanner.py.
+This module uses a different ML threshold (78% vs scanner's 55%) and
+a different decision pipeline that has not been validated under the
+current remediation plan.
+
+To use this module, the deprecation guard must be explicitly disabled
+by setting ALLOW_DEPRECATED_TRADERS = True in iqservice.py.
+This should only be done with full understanding of the risks.
+
+See CHANGELOG_REMEDIATION.md for details.
 """
+
+import warnings
+from iqservice import ALLOW_DEPRECATED_TRADERS
+
+if not ALLOW_DEPRECATED_TRADERS:
+    raise ImportError(
+        f"{__name__} is deprecated and disabled during remediation. "
+        "Use asset_scanner.py instead. "
+        "If you have a valid reason to use this module, set "
+        "ALLOW_DEPRECATED_TRADERS=True in iqservice.py with documented justification."
+    )
+
+warnings.warn(
+    f"{__name__} is deprecated. Use asset_scanner.py instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 import asyncio
 import json

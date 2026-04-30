@@ -1,17 +1,38 @@
 """
 paper_trader.py – Modo Paper Trading (Forward Test sobre cuenta demo)
 
-Opera exactamente como TradingBot pero:
-  - Nunca envía órdenes reales al broker (simula aceptación inmediata)
-  - Determina WIN/LOSS comparando precio de entrada vs precio al vencimiento
-    usando el feed de precios en tiempo real de Exnova
-  - Registra cada trade completo (features + resultado) en trades.db
-  - Acumula el dataset de entrenamiento para el clasificador ML (Fase 4)
+DEPRECATED: This module is deprecated as of remediation/v1.
 
-Uso:
-    python main.py --mode paper
+The official trading pipeline is asset_scanner.py.
+This module uses a different ML threshold (78% vs scanner's 55%) and
+a different decision pipeline that has not been validated under the
+current remediation plan.
+
+To use this module, the deprecation guard must be explicitly disabled
+by setting ALLOW_DEPRECATED_TRADERS = True in iqservice.py.
+This should only be done with full understanding of the risks.
+
+See CHANGELOG_REMEDIATION.md for details.
 """
+
 from __future__ import annotations
+
+import warnings
+from iqservice import ALLOW_DEPRECATED_TRADERS
+
+if not ALLOW_DEPRECATED_TRADERS:
+    raise ImportError(
+        f"{__name__} is deprecated and disabled during remediation. "
+        "Use asset_scanner.py instead. "
+        "If you have a valid reason to use this module, set "
+        "ALLOW_DEPRECATED_TRADERS=True in iqservice.py with documented justification."
+    )
+
+warnings.warn(
+    f"{__name__} is deprecated. Use asset_scanner.py instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 import asyncio
 import logging

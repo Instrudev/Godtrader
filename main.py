@@ -45,10 +45,35 @@ def _parse_mode() -> str:
 _BOT_MODE = _parse_mode()
 
 from asset_scanner import asset_scanner
-from iqservice import iq_service
+from iqservice import iq_service, REMEDIATION_MODE
 from retrain_scheduler import retrain_scheduler
 
-if _BOT_MODE == "paper":
+# ─── Deprecated: trader/paper_trader bloqueados durante remediación ──────────
+# En modo remediación, el motor oficial es asset_scanner.
+# trading_bot se reemplaza por un stub inerte para no romper endpoints legacy.
+
+class _DeprecatedBotStub:
+    """Stub inerte que reemplaza trading_bot durante remediación."""
+    running = False
+    on_notification = None
+    signal_history = []
+
+    def start(self, *a, **kw):
+        raise RuntimeError("REMEDIATION MODE — trader/paper_trader deprecated. Use asset_scanner.")
+
+    def stop(self):
+        pass
+
+    def get_status(self):
+        return {"running": False, "deprecated": True, "message": "Use asset_scanner instead"}
+
+if REMEDIATION_MODE:
+    trading_bot = _DeprecatedBotStub()
+    logging.getLogger(__name__).warning(
+        "═══ REMEDIATION MODE — trader/paper_trader DEPRECATED ═══ "
+        "(use asset_scanner)"
+    )
+elif _BOT_MODE == "paper":
     from paper_trader import paper_trading_bot as trading_bot
     logging.getLogger(__name__).info("═══ MODO PAPER TRADING ═══ (sin órdenes reales)")
 else:
