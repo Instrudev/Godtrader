@@ -31,10 +31,13 @@ import numpy as np
 import pandas as pd
 
 from database import get_winrate_by_hour, get_winrate_by_weekday, fetch_recent_losses
+from iqservice import OTC_ONLY_MODE
 
 logger = logging.getLogger(__name__)
 
 # ─── Umbrales por defecto (todos configurables) ────────────────────────────────
+
+OTC_ASSET_SUFFIX = "-OTC"
 
 # Historial: 0.52 (original) → 0.39 (acumulación datos) → 0.55 (remediación)
 # 0.55 = breakeven con margen de seguridad sobre payout 80-83%
@@ -356,6 +359,31 @@ def drift_filter(asset: str) -> FilterResult:
     return FilterResult.ok()
 
 
+def otc_only_filter(
+    asset: str,
+    otc_only: Optional[bool] = None,
+) -> FilterResult:
+    """
+    Bloquea activos no-OTC cuando OTC_ONLY_MODE está activo.
+
+    El bot está calibrado para mercados OTC sintéticos (PRNG del broker).
+    Operar en activos no-OTC introduce comportamiento de mercado real
+    no validado por la remediación.
+    """
+    if otc_only is None:
+        otc_only = OTC_ONLY_MODE
+
+    if not otc_only:
+        return FilterResult.ok()
+
+    if not asset.endswith(OTC_ASSET_SUFFIX):
+        return FilterResult.block(
+            "otc_only_filter",
+            f"{asset} no es OTC (sufijo '{OTC_ASSET_SUFFIX}' requerido). Bloqueado.",
+        )
+    return FilterResult.ok()
+
+
 def blocked_hours_filter(hour: int) -> FilterResult:
     """Bloquea horas UTC con winrate históricamente < 40%."""
     if hour in BLOCKED_HOURS:
@@ -593,6 +621,7 @@ def check_all_filters(
     now_utc = datetime.now(timezone.utc)
 
     filters_to_run = [
+        lambda: otc_only_filter(asset),
         lambda: blocked_hours_filter(now_utc.hour),
         lambda: blocked_weekday_filter(now_utc.weekday()),
         lambda: blocked_asset_filter(asset),

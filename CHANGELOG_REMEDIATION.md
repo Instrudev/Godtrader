@@ -11,6 +11,34 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 3.0.1 — Limpieza arquitectónica (2026-04-30)
+
+### Decisiones
+1. `trades.db` sacado de git tracking permanentemente.
+2. Empezar con BD vacía (descartar 336 trades pre-remediación).
+3. Filtro OTC explícito implementado.
+
+### Razones
+- BD trackeada en git causó incidente de cambio inexplicado durante checkout de branches.
+- Datos pre-remediación contaminados (sin filtros, ML inválido, 0 trades con features completas).
+- Empezar limpio garantiza dataset coherente para Tarea 3.1.
+
+### BDs preservadas (fuera de git)
+- `archive/databases/trades_pre_remediation_336trades_*.db`
+- `archive/databases/trades_backup_407trades_*.db`
+- `archive/databases/HASHES.txt` con SHA256.
+
+### Filtro OTC
+- `OTC_ONLY_MODE = True` en `iqservice.py`.
+- `otc_only_filter` en posición 1 de `check_all_filters`.
+- `OTC_ASSET_SUFFIX = "-OTC"` en `regime_filter.py`.
+- 5 tests de cobertura.
+
+### Tests ajustados
+- 3 tests con `asset="X"` → `asset="X-OTC"`.
+
+---
+
 ## Tarea 2.1 — ML drift detector (minimum viable implementation) (2026-04-30) — ÚLTIMA TAREA FASE 2
 
 ### Alcance Mínimo Viable

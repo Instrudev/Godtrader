@@ -348,7 +348,7 @@ def test_check_all_filters_blocks_on_consecutive_losses() -> None:
          patch("regime_filter.drift_filter", return_value=FilterResult.ok()), \
          patch("regime_filter.datetime") as mock_dt:
         mock_dt.now.return_value = _safe_datetime()
-        result = check_all_filters(df=df, asset="X", trade_log=log, payout=0.85, max_consecutive=3)
+        result = check_all_filters(df=df, asset="X-OTC", trade_log=log, payout=0.85, max_consecutive=3)
     assert result.allow is False
     assert result.auto_shutdown is True
 
@@ -360,7 +360,7 @@ def test_check_all_filters_blocks_on_low_payout() -> None:
          patch("regime_filter.drift_filter", return_value=FilterResult.ok()), \
          patch("regime_filter.datetime") as mock_dt:
         mock_dt.now.return_value = _safe_datetime()
-        result = check_all_filters(df=df, asset="X", trade_log=[], payout=0.60, min_payout=0.80)
+        result = check_all_filters(df=df, asset="X-OTC", trade_log=[], payout=0.60, min_payout=0.80)
     assert result.allow is False
     assert result.filter_name == "payout_filter"
 
@@ -374,7 +374,7 @@ def test_check_all_filters_returns_first_failure() -> None:
          patch("regime_filter.drift_filter", return_value=FilterResult.ok()), \
          patch("regime_filter.datetime") as mock_dt:
         mock_dt.now.return_value = _safe_datetime()
-        result = check_all_filters(df=df, asset="X", trade_log=log, payout=0.85,
+        result = check_all_filters(df=df, asset="X-OTC", trade_log=log, payout=0.85,
                                     max_daily_losses=3, max_consecutive=3)
     assert result.filter_name == "daily_loss_filter"
 
@@ -771,3 +771,41 @@ def test_walkforward_enabled_constant_is_false() -> None:
     """WALKFORWARD_ENABLED default es False durante remediación."""
     from regime_filter import WALKFORWARD_ENABLED
     assert WALKFORWARD_ENABLED is False
+
+
+# ─── Tarea 3.0.1: Filtro OTC ────────────────────────────────────────────────
+
+def test_otc_only_filter_blocks_non_otc() -> None:
+    """Activo sin sufijo -OTC → bloqueado."""
+    from regime_filter import otc_only_filter
+    result = otc_only_filter("EURUSD", otc_only=True)
+    assert result.allow is False
+    assert result.filter_name == "otc_only_filter"
+
+
+def test_otc_only_filter_allows_otc() -> None:
+    """Activo con sufijo -OTC → permitido."""
+    from regime_filter import otc_only_filter
+    result = otc_only_filter("EURUSD-OTC", otc_only=True)
+    assert result.allow is True
+
+
+def test_otc_only_filter_disabled_allows_all() -> None:
+    """Con otc_only=False, cualquier activo pasa."""
+    from regime_filter import otc_only_filter
+    result = otc_only_filter("EURUSD", otc_only=False)
+    assert result.allow is True
+
+
+def test_otc_only_filter_blocks_eurjpy_op() -> None:
+    """Caso histórico anómalo EURJPY-op → bloqueado."""
+    from regime_filter import otc_only_filter
+    result = otc_only_filter("EURJPY-op", otc_only=True)
+    assert result.allow is False
+
+
+def test_otc_only_filter_blocks_bxy() -> None:
+    """Caso histórico anómalo BXY → bloqueado."""
+    from regime_filter import otc_only_filter
+    result = otc_only_filter("BXY", otc_only=True)
+    assert result.allow is False

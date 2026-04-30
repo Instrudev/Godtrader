@@ -37,6 +37,14 @@ ML_DISABLED_MAX_ASSET_LOSSES: int = 2      # Pérdidas máx por activo (vs 3 nor
 ML_DISABLED_MAX_DAILY_LOSSES: int = 4      # Pérdidas máx globales (vs 6 normal)
 ML_DISABLED_MAX_DAILY_TRADES: int = 5      # Trades máx por día (vs 15 normal)
 
+# ─── Modo solo OTC (Tarea 3.0.1) ────────────────────────────────────────────
+OTC_ONLY_MODE: bool = True
+"""
+Restringe operaciones a activos terminados en '-OTC'.
+El bot está calibrado para mercados OTC sintéticos. Operar en no-OTC
+introduce comportamiento de mercado real no validado por la remediación.
+"""
+
 # ─── Logger de seguridad dedicado ────────────────────────────────────────────
 
 _security_logger = logging.getLogger("security_halts")

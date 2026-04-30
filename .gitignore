@@ -12,6 +12,18 @@ venv/
 models/*.pkl
 models/versions/
 
+# Runtime database (not versioned — init_db creates on first run)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.db.backup*
+*.sqlite
+*.sqlite3
+
+# Local database archives (historical, not committed)
+archive/databases/
+
 # Datos temporales
 trades_history.json
 .pytest_cache/
