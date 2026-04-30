@@ -40,6 +40,29 @@
 
 ---
 
+## Cambios pre-plan preservados (2026-04-30)
+
+Branch archivo: `pre-remediation-changes` (no mergeable)
+
+Cambios hechos antes del plan de remediación, preservados para auditoría formal en sus tareas correspondientes.
+
+| Archivo | Cambio | Tarea de re-evaluación |
+|---|---|---|
+| `indicators.py` | RSI 35/65 → 30/70 en `pre_qualify_classical()` | 2.2 |
+| `indicators.py` | BB body reversal: `bb_mid` → `bb_upper` en `detect_bb_body_reversal()` | 2.3 |
+| `asset_scanner.py` | RSI 30/70 en `_infer_direction()` y `_score_signal()` | 2.2 |
+| `asset_scanner.py` | MIN_PROBABILITY 48 → 55, threads 5→3, dedup assets, reconnect logic | 2.2 / 2.4 |
+| `regime_filter.py` | Whitelist forex (ALLOWED_ASSETS), BLOCKED_HOURS/WEEKDAYS vaciados | 2.4 |
+| `regime_filter.py` | BLOCKED_ASSETS ampliado (+AUDCAD-OTC, +GBPJPY-OTC) | 2.4 |
+| `ml_classifier.py` | Ajuste menor (3 líneas) | 1.5 / 1.7 |
+| `tests/test_regime_filter.py` | _safe_datetime → Lunes 15h, asset "X" → "EURUSD-OTC" | 2.4 |
+| `tests/test_ml_classifier.py` | Adaptación a cambios de ml_classifier | 1.5 |
+
+Cada cambio será auditado individualmente en su tarea correspondiente.
+Pueden ser cherry-picked, re-implementados o descartados según decisión arquitectónica.
+
+---
+
 ## Cómo salir del modo remediación
 
 Cuando la remediación esté completa y todas las fases hayan pasado sus criterios de aceptación:
