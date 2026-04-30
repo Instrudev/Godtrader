@@ -91,12 +91,25 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    from iqservice import REMEDIATION_MODE, FORCE_DEMO_ACCOUNT
+    from iqservice import REMEDIATION_MODE, FORCE_DEMO_ACCOUNT, ML_DISABLED_MODE
     if REMEDIATION_MODE:
         logger.warning(
             "═══ REMEDIATION MODE — DEMO ONLY ═══ "
-            f"(FORCE_DEMO_ACCOUNT={FORCE_DEMO_ACCOUNT})"
+            f"(FORCE_DEMO_ACCOUNT={FORCE_DEMO_ACCOUNT}, "
+            f"ML_DISABLED={ML_DISABLED_MODE})"
         )
+        if ML_DISABLED_MODE:
+            from iqservice import (
+                ML_DISABLED_MIN_SCORE, ML_DISABLED_MAX_ASSET_LOSSES,
+                ML_DISABLED_MAX_DAILY_LOSSES, ML_DISABLED_MAX_DAILY_TRADES,
+            )
+            logger.warning(
+                "OPERATING WITHOUT ML — REDUCED RISK MODE | "
+                f"min_score={ML_DISABLED_MIN_SCORE} | "
+                f"max_asset_losses={ML_DISABLED_MAX_ASSET_LOSSES} | "
+                f"max_daily_losses={ML_DISABLED_MAX_DAILY_LOSSES} | "
+                f"max_daily_trades={ML_DISABLED_MAX_DAILY_TRADES}"
+            )
         logger.warning("REMEDIATION MODE — retrain_scheduler disabled")
     else:
         await retrain_scheduler.start()

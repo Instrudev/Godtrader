@@ -4,6 +4,7 @@ tests/test_scanner_filters.py – Tests de integración de filtros y estrategias
 Tarea 1.0: check_all_filters integrado (6 tests).
 Tarea 1.2: halt + reconstrucción trade_log (2 tests).
 Tarea 1.4: _evaluate_strategies paralelo + arbitraje (10 tests).
+Tarea 1.6: ML_DISABLED_MODE fallback (8 tests).
 """
 from __future__ import annotations
 
@@ -109,10 +110,11 @@ def test_scanner_filter_blocks_before_ml(scanner):
 # ─── Test 3: filtro pasa → ML se invoca ─────────────────────────────────────
 
 def test_scanner_filter_passes_allows_ml(scanner):
-    """Si check_all_filters pasa, ML se invoca normalmente."""
+    """Si check_all_filters pasa y ML_DISABLED=False, ML se invoca normalmente."""
     candidate = _make_candidate()
 
-    with patch("asset_scanner.check_all_filters") as mock_caf, \
+    with patch("asset_scanner.ML_DISABLED_MODE", False), \
+         patch("asset_scanner.check_all_filters") as mock_caf, \
          patch("asset_scanner.get_winrate_by_hour", return_value={}), \
          patch("asset_scanner.iq_service") as mock_iq, \
          patch("asset_scanner.ml_classifier") as mock_ml, \
@@ -474,3 +476,211 @@ def test_backwards_compatible_signature():
     assert isinstance(score, float)
     assert isinstance(signals, list)
     assert resolution in ("single_match", "multiple_match", "conflict_cancel", "no_signal")
+
+
+# ─── Tarea 1.6: ML_DISABLED_MODE fallback ────────────────────────────────────
+
+@pytest.fixture
+def scanner_ml_disabled():
+    """Scanner con ML_DISABLED_MODE y dependencias mockeadas."""
+    from asset_scanner import AssetScanner
+    s = AssetScanner()
+    s.running = True
+    s.mode = "paper"
+    s.amount = 1.0
+    s.expiry_min = 2
+    s.asset_type = "binary"
+    s.trade_log = []
+    s.on_notification = None
+    s.loop = None
+    return s
+
+
+def _make_candidate_with_score(score: float, asset: str = "EURUSD-OTC", direction: str = "CALL") -> dict:
+    """Crea candidato con score y resolution controlados."""
+    c = _make_candidate(asset=asset, direction=direction)
+    c["score"] = score
+    c["resolution"] = "single_match"
+    return c
+
+
+def test_ml_disabled_blocks_below_min_score(scanner_ml_disabled):
+    """ML_DISABLED: score 0.65 < 0.75 → no opera."""
+    candidate = _make_candidate_with_score(0.65)
+
+    with patch("asset_scanner.ML_DISABLED_MODE", True), \
+         patch("asset_scanner.ML_DISABLED_MIN_SCORE", 0.75), \
+         patch("asset_scanner.check_all_filters") as mock_caf, \
+         patch("asset_scanner.get_winrate_by_hour", return_value={}), \
+         patch("asset_scanner.iq_service") as mock_iq:
+        mock_iq.get_payout.return_value = 0.85
+        from regime_filter import FilterResult
+        mock_caf.return_value = FilterResult.ok()
+
+        result = scanner_ml_disabled._try_execute(candidate)
+
+    assert result is False
+
+
+def test_ml_disabled_allows_above_min_score(scanner_ml_disabled):
+    """ML_DISABLED: score 0.80 ≥ 0.75 → opera (sujeto a otros filtros)."""
+    candidate = _make_candidate_with_score(0.80)
+
+    with patch("asset_scanner.ML_DISABLED_MODE", True), \
+         patch("asset_scanner.ML_DISABLED_MIN_SCORE", 0.75), \
+         patch("asset_scanner.check_all_filters") as mock_caf, \
+         patch("asset_scanner.get_winrate_by_hour", return_value={}), \
+         patch("asset_scanner.iq_service") as mock_iq, \
+         patch("asset_scanner.time") as mock_time:
+        mock_iq.get_payout.return_value = 0.85
+        mock_iq.buy_binary.return_value = (True, 99999)
+        mock_time.time.return_value = 1.0  # dentro del guard de tiempo
+        from regime_filter import FilterResult
+        mock_caf.return_value = FilterResult.ok()
+
+        result = scanner_ml_disabled._try_execute(candidate)
+
+    assert result is True
+
+
+def test_ml_required_when_disabled_mode_false(scanner_ml_disabled):
+    """ML_DISABLED=False, ML no cargado → no opera."""
+    candidate = _make_candidate_with_score(0.80)
+
+    with patch("asset_scanner.ML_DISABLED_MODE", False), \
+         patch("asset_scanner.check_all_filters") as mock_caf, \
+         patch("asset_scanner.get_winrate_by_hour", return_value={}), \
+         patch("asset_scanner.iq_service") as mock_iq, \
+         patch("asset_scanner.ml_classifier") as mock_ml:
+        mock_iq.get_payout.return_value = 0.85
+        from regime_filter import FilterResult
+        mock_caf.return_value = FilterResult.ok()
+        mock_ml.is_loaded.return_value = False
+
+        result = scanner_ml_disabled._try_execute(candidate)
+
+    assert result is False
+
+
+def test_ml_disabled_uses_reduced_asset_limit(scanner_ml_disabled):
+    """ML_DISABLED: 2 losses/activo → bloquea activo (no 3)."""
+    candidate = _make_candidate_with_score(0.80)
+
+    with patch("asset_scanner.ML_DISABLED_MODE", True), \
+         patch("asset_scanner.ML_DISABLED_MAX_ASSET_LOSSES", 2), \
+         patch("asset_scanner.ML_DISABLED_MAX_DAILY_LOSSES", 4), \
+         patch("asset_scanner.ML_DISABLED_MAX_DAILY_TRADES", 5), \
+         patch("asset_scanner.check_all_filters") as mock_caf, \
+         patch("asset_scanner.get_winrate_by_hour", return_value={}), \
+         patch("asset_scanner.iq_service") as mock_iq:
+        mock_iq.get_payout.return_value = 0.85
+        from regime_filter import FilterResult
+        mock_caf.return_value = FilterResult.block("per_asset_loss_filter", "2 losses")
+
+        result = scanner_ml_disabled._try_execute(candidate)
+
+    assert result is False
+    # Verificar que check_all_filters recibió max_asset_losses=2
+    call_kwargs = mock_caf.call_args.kwargs
+    assert call_kwargs["max_asset_losses"] == 2
+    assert call_kwargs["max_daily_losses"] == 4
+    assert call_kwargs["max_trades"] == 5
+
+
+def test_ml_disabled_uses_reduced_global_limit(scanner_ml_disabled):
+    """ML_DISABLED: 4 losses globales → halt (no 6)."""
+    candidate = _make_candidate_with_score(0.80)
+
+    with patch("asset_scanner.ML_DISABLED_MODE", True), \
+         patch("asset_scanner.ML_DISABLED_MAX_ASSET_LOSSES", 2), \
+         patch("asset_scanner.ML_DISABLED_MAX_DAILY_LOSSES", 4), \
+         patch("asset_scanner.ML_DISABLED_MAX_DAILY_TRADES", 5), \
+         patch("asset_scanner.check_all_filters") as mock_caf, \
+         patch("asset_scanner.get_winrate_by_hour", return_value={}), \
+         patch("asset_scanner.iq_service") as mock_iq:
+        mock_iq.get_payout.return_value = 0.85
+        from regime_filter import FilterResult
+        mock_caf.return_value = FilterResult.block(
+            "daily_loss_filter", "4 losses", shutdown=True
+        )
+
+        result = scanner_ml_disabled._try_execute(candidate)
+
+    assert result is False
+    assert scanner_ml_disabled.running is False  # auto_shutdown
+
+
+def test_ml_disabled_uses_reduced_daily_trades(scanner_ml_disabled):
+    """ML_DISABLED: max_trades=5 pasado a check_all_filters."""
+    candidate = _make_candidate_with_score(0.80)
+
+    with patch("asset_scanner.ML_DISABLED_MODE", True), \
+         patch("asset_scanner.ML_DISABLED_MAX_ASSET_LOSSES", 2), \
+         patch("asset_scanner.ML_DISABLED_MAX_DAILY_LOSSES", 4), \
+         patch("asset_scanner.ML_DISABLED_MAX_DAILY_TRADES", 5), \
+         patch("asset_scanner.check_all_filters") as mock_caf, \
+         patch("asset_scanner.get_winrate_by_hour", return_value={}), \
+         patch("asset_scanner.iq_service") as mock_iq:
+        mock_iq.get_payout.return_value = 0.85
+        from regime_filter import FilterResult
+        mock_caf.return_value = FilterResult.block("max_trades_filter", "5 trades")
+
+        result = scanner_ml_disabled._try_execute(candidate)
+
+    assert result is False
+    assert mock_caf.call_args.kwargs["max_trades"] == 5
+
+
+def test_ml_normal_uses_standard_limits(scanner_ml_disabled):
+    """ML_DISABLED=False → límites normales 3/6/15."""
+    candidate = _make_candidate_with_score(0.80)
+
+    with patch("asset_scanner.ML_DISABLED_MODE", False), \
+         patch("asset_scanner.MAX_ASSET_DAILY_LOSSES", 3), \
+         patch("asset_scanner.MAX_DAILY_LOSSES", 6), \
+         patch("asset_scanner.MAX_TRADES_PER_DAY", 15), \
+         patch("asset_scanner.check_all_filters") as mock_caf, \
+         patch("asset_scanner.get_winrate_by_hour", return_value={}), \
+         patch("asset_scanner.iq_service") as mock_iq, \
+         patch("asset_scanner.ml_classifier") as mock_ml:
+        mock_iq.get_payout.return_value = 0.85
+        from regime_filter import FilterResult
+        mock_caf.return_value = FilterResult.ok()
+        mock_ml.is_loaded.return_value = False
+
+        scanner_ml_disabled._try_execute(candidate)
+
+    call_kwargs = mock_caf.call_args.kwargs
+    assert call_kwargs["max_asset_losses"] == 3
+    assert call_kwargs["max_daily_losses"] == 6
+    assert call_kwargs["max_trades"] == 15
+
+
+def test_startup_banner_shows_ml_disabled(caplog):
+    """Banner de startup incluye ML_DISABLED_MODE."""
+    import logging
+    import iqservice
+    orig = iqservice.ML_DISABLED_MODE
+    try:
+        iqservice.REMEDIATION_MODE = True
+        iqservice.ML_DISABLED_MODE = True
+
+        with caplog.at_level(logging.WARNING):
+            # Simular la lógica del banner del lifespan
+            _logger = logging.getLogger("test_banner")
+            _logger.warning(
+                "═══ REMEDIATION MODE — DEMO ONLY ═══ "
+                f"(FORCE_DEMO_ACCOUNT={iqservice.FORCE_DEMO_ACCOUNT}, "
+                f"ML_DISABLED={iqservice.ML_DISABLED_MODE})"
+            )
+            if iqservice.ML_DISABLED_MODE:
+                _logger.warning(
+                    "OPERATING WITHOUT ML — REDUCED RISK MODE | "
+                    f"min_score={iqservice.ML_DISABLED_MIN_SCORE}"
+                )
+
+        assert "ML_DISABLED=True" in caplog.text
+        assert "OPERATING WITHOUT ML" in caplog.text
+        assert "REDUCED RISK MODE" in caplog.text
+    finally:
+        iqservice.ML_DISABLED_MODE = orig

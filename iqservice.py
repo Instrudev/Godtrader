@@ -27,6 +27,16 @@ FORCE_DEMO_ACCOUNT: bool = True     # True = bloquear ejecución en cuenta real
 ALLOWED_ACCOUNT_TYPES = {"PRACTICE"}  # Whitelist de tipos de cuenta permitidos
 ALLOW_DEPRECATED_TRADERS: bool = False  # True = permitir import de trader/paper_trader/ai_brain
 
+# ─── Modo sin ML (Tarea 1.6) ────────────────────────────────────────────────
+# Activado tras hallazgos de Tarea 1.5: modelo ML no añade valor predictivo real.
+# Temporal hasta reentrenamiento con AUC ≥ 0.62 (Tarea 3.1).
+
+ML_DISABLED_MODE: bool = True              # True = operar sin ML gate
+ML_DISABLED_MIN_SCORE: float = 0.75        # Score mínimo de estrategia sin ML
+ML_DISABLED_MAX_ASSET_LOSSES: int = 2      # Pérdidas máx por activo (vs 3 normal)
+ML_DISABLED_MAX_DAILY_LOSSES: int = 4      # Pérdidas máx globales (vs 6 normal)
+ML_DISABLED_MAX_DAILY_TRADES: int = 5      # Trades máx por día (vs 15 normal)
+
 # ─── Logger de seguridad dedicado ────────────────────────────────────────────
 
 _security_logger = logging.getLogger("security_halts")

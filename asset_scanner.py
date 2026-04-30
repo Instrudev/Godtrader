@@ -46,9 +46,21 @@ from indicators import (
     get_streak_info,
     pre_qualify,
 )
-from iqservice import iq_service
+from iqservice import (
+    iq_service,
+    ML_DISABLED_MODE,
+    ML_DISABLED_MIN_SCORE,
+    ML_DISABLED_MAX_ASSET_LOSSES,
+    ML_DISABLED_MAX_DAILY_LOSSES,
+    ML_DISABLED_MAX_DAILY_TRADES,
+)
 from ml_classifier import ml_classifier, extract_features
-from regime_filter import check_all_filters
+from regime_filter import (
+    check_all_filters,
+    MAX_ASSET_DAILY_LOSSES,
+    MAX_DAILY_LOSSES,
+    MAX_TRADES_PER_DAY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -667,13 +679,30 @@ class AssetScanner:
             logger.warning(f"[SCANNER] {asset}: error contexto → {e}")
             return False
 
-        # ── Filtros de régimen OTC (13 filtros via check_all_filters) ─────────
+        # ── Defaults para variables usadas más adelante en logging/persistencia ─
+        proba  = 0.5
+        pr_pct = 50
+
+        # ── Determinar límites según modo ML ─────────────────────────────────
+        if ML_DISABLED_MODE:
+            asset_loss_limit = ML_DISABLED_MAX_ASSET_LOSSES
+            daily_loss_limit = ML_DISABLED_MAX_DAILY_LOSSES
+            trades_limit     = ML_DISABLED_MAX_DAILY_TRADES
+        else:
+            asset_loss_limit = MAX_ASSET_DAILY_LOSSES
+            daily_loss_limit = MAX_DAILY_LOSSES
+            trades_limit     = MAX_TRADES_PER_DAY
+
+        # ── Filtros de régimen OTC (14 filtros via check_all_filters) ─────────
         regime = check_all_filters(
             df=df,
             asset=asset,
             trade_log=self.trade_log,
             payout=payout,
             direction=direction,
+            max_asset_losses=asset_loss_limit,
+            max_daily_losses=daily_loss_limit,
+            max_trades=trades_limit,
         )
         if not regime.allow:
             logger.info(f"[SCANNER] {asset}: ✗ {regime.filter_name}: {regime.reason}")
@@ -683,47 +712,63 @@ class AssetScanner:
                 self.running = False
             return False
 
-        # ── Validación ML (solo si hay datos suficientes) ─────────────────────
-        proba  = 0.5   # valor por defecto cuando el ML no está listo
-        pr_pct = 50
-
-        try:
-            from database import fetch_trades
-            closed_count = len([
-                t for t in fetch_trades(limit=9999, path=DB_PATH)
-                if t.get("result") in ("WIN", "LOSS")
-            ])
-        except Exception:
-            closed_count = 0
-
-        ml_active = ml_classifier.is_loaded() and closed_count >= ML_MIN_TRADES
-
-        if ml_active:
-            try:
-                features  = extract_features(
-                    df, payout=payout, winrate_hour=winrate_hour, direction=direction, expiry_min=self.expiry_min
-                )
-                if features is None:
-                    logger.info(f"[SCANNER] {asset}: features None. Skip.")
-                    return False
-                probas    = ml_classifier.predict_proba(features)
-                proba_key = "call_proba" if direction == "CALL" else "put_proba"
-                proba     = probas.get(proba_key, 0.5)
-                pr_pct    = int(round(proba * 100))
-            except Exception as e:
-                logger.warning(f"[SCANNER] {asset}: error ML → {e}")
-
+        # ── Validación ML o Score de estrategia ───────────────────────────────
+        if ML_DISABLED_MODE:
+            # Sin ML: validar por score de estrategia
+            score = candidate.get("score", 0.0)
             logger.info(
-                f"[SCANNER] {asset} | {direction} | ML proba={pr_pct}% | umbral={MIN_PROBABILITY}%"
+                f"[SCANNER] {asset} | {direction} | ML_DISABLED | "
+                f"score={score:.3f} | umbral={ML_DISABLED_MIN_SCORE}"
             )
-            if pr_pct < MIN_PROBABILITY:
-                logger.info(f"[SCANNER] {asset}: rechazado por ML ({pr_pct}% < {MIN_PROBABILITY}%)")
+            if score < ML_DISABLED_MIN_SCORE:
+                logger.info(
+                    f"[SCANNER] {asset}: score {score:.3f} < {ML_DISABLED_MIN_SCORE}. "
+                    "Rechazado (ML_DISABLED_MODE)."
+                )
                 return False
         else:
-            logger.info(
-                f"[SCANNER] {asset} | {direction} | "
-                f"ML en modo recolección ({closed_count}/{ML_MIN_TRADES} trades) — ejecutando por estrategia pura"
-            )
+            # Con ML: validación estándar
+            proba  = 0.5
+            pr_pct = 50
+
+            try:
+                from database import fetch_trades
+                closed_count = len([
+                    t for t in fetch_trades(limit=9999, path=DB_PATH)
+                    if t.get("result") in ("WIN", "LOSS")
+                ])
+            except Exception:
+                closed_count = 0
+
+            ml_active = ml_classifier.is_loaded() and closed_count >= ML_MIN_TRADES
+
+            if ml_active:
+                try:
+                    features = extract_features(
+                        df, payout=payout, winrate_hour=winrate_hour,
+                        direction=direction, expiry_min=self.expiry_min,
+                    )
+                    if features is None:
+                        logger.info(f"[SCANNER] {asset}: features None. Skip.")
+                        return False
+                    probas    = ml_classifier.predict_proba(features)
+                    proba_key = "call_proba" if direction == "CALL" else "put_proba"
+                    proba     = probas.get(proba_key, 0.5)
+                    pr_pct    = int(round(proba * 100))
+                except Exception as e:
+                    logger.warning(f"[SCANNER] {asset}: error ML → {e}")
+
+                logger.info(
+                    f"[SCANNER] {asset} | {direction} | ML proba={pr_pct}% | umbral={MIN_PROBABILITY}%"
+                )
+                if pr_pct < MIN_PROBABILITY:
+                    logger.info(f"[SCANNER] {asset}: rechazado por ML ({pr_pct}% < {MIN_PROBABILITY}%)")
+                    return False
+            else:
+                logger.info(
+                    f"[SCANNER] {asset}: ML requerido pero no cargado. No se opera."
+                )
+                return False
 
         # ── Guardia de tiempo: no entrar si ya pasaron muchos segundos de la vela ─
         secs_into_candle = time.time() % CANDLE_INTERVAL

@@ -11,6 +11,55 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 1.6 — ML disabled fallback mode (2026-04-30)
+
+### Activación
+Consecuencia directa de hallazgos de Tarea 1.5: modelo ML no añade valor predictivo real (78% features importancia=0, `direction` importancia=0, calibrador comprime a ~0.5).
+
+### Modo de operación sin ML
+| Parámetro | ML Enabled | ML Disabled |
+|---|---|---|
+| Gate de entrada | ML proba ≥ 55% | Strategy score ≥ 0.75 |
+| Pérdidas/activo | 3 | **2** |
+| Pérdidas globales | 6 | **4** |
+| Trades/día | 15 | **5** |
+| `consecutive_loss` | 3 | 3 (sin cambio) |
+
+### Constantes en `iqservice.py` (5 nuevas)
+- `ML_DISABLED_MODE = True`
+- `ML_DISABLED_MIN_SCORE = 0.75`
+- `ML_DISABLED_MAX_ASSET_LOSSES = 2`
+- `ML_DISABLED_MAX_DAILY_LOSSES = 4`
+- `ML_DISABLED_MAX_DAILY_TRADES = 5`
+
+### Cambios en `asset_scanner.py`
+- Imports de constantes ML_DISABLED al inicio del módulo (Condición 1).
+- Límites condicionales pasados a `check_all_filters` según modo.
+- Bloque de validación: si `ML_DISABLED`, verifica `candidate["score"]` vs `ML_DISABLED_MIN_SCORE`. Si no, requiere ML cargado obligatoriamente.
+- Variables `proba`/`pr_pct` inicializadas antes del condicional (fix UnboundLocalError).
+
+### Cambios en `main.py`
+- Banner de startup muestra `ML_DISABLED=True/False`.
+- Si True: loguea "OPERATING WITHOUT ML — REDUCED RISK MODE" con todos los límites.
+
+### Test de Tarea 1.0 actualizado
+`test_scanner_filter_passes_allows_ml` patchea `ML_DISABLED_MODE=False` para probar el flujo ML.
+
+### Reversión
+Cambiar `ML_DISABLED_MODE = False` en `iqservice.py` tras reentrenamiento exitoso (Tarea 3.1, AUC ≥ 0.62).
+
+### Tests añadidos (8)
+1. `test_ml_disabled_blocks_below_min_score` — score 0.65 < 0.75 → no opera
+2. `test_ml_disabled_allows_above_min_score` — score 0.80 ≥ 0.75 → opera
+3. `test_ml_required_when_disabled_mode_false` — ML no cargado → no opera
+4. `test_ml_disabled_uses_reduced_asset_limit` — max_asset_losses=2
+5. `test_ml_disabled_uses_reduced_global_limit` — max_daily_losses=4, auto_shutdown
+6. `test_ml_disabled_uses_reduced_daily_trades` — max_trades=5
+7. `test_ml_normal_uses_standard_limits` — ML_DISABLED=False → 3/6/15
+8. `test_startup_banner_shows_ml_disabled` — banner con ML_DISABLED + limits
+
+---
+
 ## Tarea 1.5 — Auditoría ML + carga explícita con verificación SHA256 (2026-04-30)
 
 ### Hallazgos estructurales del modelo (FASE A)
