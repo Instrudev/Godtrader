@@ -11,6 +11,32 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 1.7 — Auditoría dataset ML (2026-04-30) — ÚLTIMA TAREA FASE 1
+
+### Hallazgos
+- **0 trades con features completas** en dataset actual (0/114). Ningún trade cumple los requisitos del modelo.
+- **Anti-patrón `_row_to_features`:** rellena NULL con defaults, eliminando varianza en 68% del dataset. Causa raíz de feature_importances=0 en 21/27 features (Tarea 1.5).
+- **2 trades no-OTC** confirmados: `EURJPY-op` (id=421), `BXY` (id=422). Excluidos permanentemente.
+- **Pipeline scanner no popula features streak** (0/78 trades). **Pipeline trader no popula PRNG** (0/36 trades).
+- **Dataset NO viable para reentrenamiento inmediato.**
+
+### Decisiones
+- Tarea 3.1 (reentrenamiento) **en espera** hasta acumular dataset válido.
+- Criterios mínimos: 200 trades con features completas, bot operando post-remediación, ≥30 días continuos.
+- Estimación: 2-6 meses de operación continua (1-3 trades/día con score ≥0.75).
+- Revisar criterios cada 30 días.
+
+### Issues registrados para Tarea 3.1
+1. `_row_to_features` anti-patrón (NULL → defaults sin varianza).
+2. Pipeline scanner sin features streak/retorno.
+3. Pipeline trader sin features PRNG (deprecated, irrelevante si scanner es único motor).
+4. `train_model.py` sin `metrics.json`.
+
+### Reporte generado
+`reports/dataset_audit_20260430_172822_UTC.md` — 9 secciones con inventario, contaminación, features, anti-patrón, conclusión, especificación Tarea 3.1, estimación temporal, issues, trades excluidos.
+
+---
+
 ## Tarea 1.6 — ML disabled fallback mode (2026-04-30)
 
 ### Activación
