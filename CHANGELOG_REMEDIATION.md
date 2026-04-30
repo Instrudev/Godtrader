@@ -11,6 +11,46 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 2.1 — ML drift detector (minimum viable implementation) (2026-04-30) — ÚLTIMA TAREA FASE 2
+
+### Alcance Mínimo Viable
+Implementación parcial intencional. Funcionalidad completa diferida a Tarea 3.1.
+
+### Implementado
+- `ml_drift_detector.py`: módulo dedicado con clase `DriftDetector`.
+- Buffer circular de últimas 100 predicciones (`deque(maxlen=100)`).
+- `record_prediction(call_proba, put_proba, asset)` registra en buffer.
+- Stats de distribución: mean, std, percentiles 25/50/75, min, max.
+- KL divergence: 10 bins equidistantes, epsilon 1e-10, `KL(observed || baseline)`.
+- Alerta cuando KL > 0.15 (configurable).
+- `get_metrics()` para snapshot de dashboard.
+- Logger JSONL dedicado: `logs/ml_drift.log`.
+- Singleton: `drift_detector = DriftDetector()`.
+- Integración en `ml_classifier.predict_proba()` (registro después del cálculo).
+- Activación condicional: solo ejecuta cuando ML activo (el flujo del scanner no llega a `predict_proba` con `ML_DISABLED_MODE=True`).
+
+### Diferido a Tarea 3.1
+1. **baseline_distribution.json**: `train_model.py` debe guardar distribución del validation set. `DriftDetector.load_baseline()` la carga lazy.
+2. **Vinculación predicción↔resultado**: `record_result(trade_id, result)` para calibración real-time. Requiere propagar trade_id a través de 3 funciones del scanner.
+3. **Calibración real-time**: Alerta cuando tasa real < predicción media − 5%. Requiere `record_result`.
+
+### Decisiones arquitectónicas
+- Módulo separado (no en ml_classifier): transversal, podría monitorear múltiples modelos.
+- Singleton de módulo (consistente con ml_classifier, asset_scanner).
+- Lazy load de baseline (sin coupling con startup).
+- Frecuencia: check cada 10 predicciones (compromiso actualización/costo).
+- Logging debug en errores de record (no pass silencioso).
+
+### Tests añadidos (6)
+1. `test_drift_records_predictions` — buffer almacena correctamente
+2. `test_drift_computes_distribution_stats` — mean/std/percentiles
+3. `test_drift_kl_divergence_identical` — distribuciones iguales → KL ≈ 0
+4. `test_drift_kl_divergence_different` — distribuciones distintas → KL > 0
+5. `test_drift_alerts_on_high_kl` — KL > 0.15 → alerta registrada
+6. `test_drift_buffer_circular` — buffer mantiene solo últimos 100
+
+---
+
 ## Tarea 2.4 — Desactivar filtros dinámicos de winrate (curve-fitting eliminado) (2026-04-30)
 
 ### Problema

@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from ml_drift_detector import drift_detector
+
 import numpy as np
 import pandas as pd
 
@@ -386,6 +388,12 @@ class MLClassifier:
             # Clamp al rango [0, 1] por seguridad
             call_proba = max(0.0, min(1.0, call_proba))
             put_proba  = max(0.0, min(1.0, put_proba))
+
+            # Registrar predicción para drift detection
+            try:
+                drift_detector.record_prediction(call_proba, put_proba)
+            except Exception as exc:
+                logger.debug(f"[ML_DRIFT] record error: {exc}")
 
             return {"call_proba": call_proba, "put_proba": put_proba}
 
