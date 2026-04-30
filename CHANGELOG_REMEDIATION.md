@@ -11,6 +11,53 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 1.5 — Auditoría ML + carga explícita con verificación SHA256 (2026-04-30)
+
+### Hallazgos estructurales del modelo (FASE A)
+1. **21/27 features (78%) con importancia 0** — modelo no aprendió de la mayoría de inputs.
+2. **`direction` con importancia 0** — no distingue CALL de PUT. Predicciones son efectivamente iguales.
+3. **Top 3 features concentran 90% del peso** — `bb_width_pct` (38%), `rsi` (30%), `bb_pct_b` (22%). Clasificador BB/RSI disfrazado de modelo de 27 features.
+4. **Calibrador Platt casi neutro** (coef=0.102) — no corrige significativamente.
+5. **9 features PRNG inútiles** — solo 1 de 9 con importancia marginal.
+6. **Dataset insuficiente** — 114 trades, 32% con features ML pobladas. Métricas cuantitativas no serían concluyentes.
+
+### Conclusión: MODELO NO AÑADE VALOR PREDICTIVO REAL
+Decisión: **Activar Tarea 1.6** (política fallback sin ML).
+
+### Cambios en `ml_classifier.py`
+- Nuevo método `load_with_verification(path, expected_hash)` — verifica SHA256 antes de cargar. Log a `security_halts.log` si hash no coincide.
+- Logging completo en `load()`: path, hash (12 chars), fecha de modificación, features activas.
+- Auto-carga implícita bloqueada en `REMEDIATION_MODE` (resuelve 2 known issues de test).
+- `get_model_info()` para snapshot de auditoría.
+- Logging checkpoint cada 100 predicciones.
+
+### Reporte generado
+`reports/ml_audit_20260430_145654_UTC.md` — análisis estructural completo con disclaimer, feature importances, calibrador, conclusión y recomendaciones.
+
+### Requisitos documentados para Tarea 3.1 (reentrenamiento futuro)
+- Mínimo 500 trades con filtros activos (post-Tarea 1.0).
+- Excluir trades pre-Tarea 1.0 y no-OTC.
+- `train_model.py` debe guardar `metrics.json`.
+- `direction` debe estar entre top 5 features.
+- Considerar 2 modelos separados (CALL/PUT).
+- Eliminar features PRNG si siguen mostrando importancia ~0.
+
+### Known issues resueltos
+- `test_classifier_no_model_returns_neutral` — ahora pasa (auto-carga bloqueada en REMEDIATION_MODE).
+- `test_classifier_predict_proba_from_df_no_model` — idem.
+- Known failures: 3 → 1.
+
+### Tests añadidos (7)
+1. `test_load_with_verification_valid_hash`
+2. `test_load_with_verification_invalid_hash`
+3. `test_auto_load_blocked_in_remediation_mode`
+4. `test_load_logs_hash_and_path`
+5. `test_audit_script_loads_model_and_validates_hash`
+6. `test_audit_script_handles_insufficient_data`
+7. `test_load_without_expected_hash`
+
+---
+
 ## Tarea 1.4 — Refactorizar lógica de decisión de dirección (2026-04-30)
 
 ### Problema resuelto
