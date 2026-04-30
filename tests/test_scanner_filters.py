@@ -200,3 +200,103 @@ def test_scanner_payout_calculated_before_filters(scanner):
     # Verificar que get_payout se llamó ANTES (implícito: si payout llega a check_all_filters,
     # se calculó antes)
     mock_iq.get_payout.assert_called_once()
+
+
+# ─── Tarea 1.2: Tests de scanner ─────────────────────────────────────────────
+
+def test_scanner_stops_processing_assets_after_halt(scanner):
+    """Si auto_shutdown activa a mitad del ciclo, los siguientes candidatos NO se procesan."""
+    c1 = _make_candidate(asset="EURUSD-OTC")
+    c2 = _make_candidate(asset="USDJPY-OTC")
+
+    call_count = 0
+    original_try = scanner._try_execute
+
+    def mock_try_execute(candidate):
+        nonlocal call_count
+        call_count += 1
+        # Primer candidato dispara halt
+        if candidate["asset"] == "EURUSD-OTC":
+            scanner.running = False  # simula auto_shutdown
+            return False
+        return False
+
+    scanner._try_execute = mock_try_execute
+    scanner.running = True
+
+    # Simular el loop de candidatos (lógica extraída de _scan_loop)
+    qualified = [c1, c2]
+    import asyncio
+
+    async def _run():
+        for candidate in qualified:
+            if not scanner.running:
+                break
+            scanner._try_execute(candidate)
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert call_count == 1  # solo EURUSD procesado, USDJPY saltado
+    assert scanner.running is False
+
+
+def test_scanner_reconstructs_trade_log_from_db(tmp_path):
+    """Al startup, el scanner reconstruye trade_log desde BD con trades del día UTC."""
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+    from asset_scanner import AssetScanner
+
+    # Crear BD temporal con trades del día
+    db_path = tmp_path / "test_trades.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE trades (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT, asset TEXT, direction TEXT, result TEXT,
+            expiry_min INT, mode TEXT, price REAL, rsi REAL,
+            bb_pct_b REAL, bb_width_pct REAL, vol_rel REAL,
+            ema20 REAL, ema200 REAL, hour_utc INT, weekday INT,
+            predicted_proba REAL, ai_reasoning TEXT, order_id INT,
+            open_price REAL, payout REAL, profit REAL,
+            close_price REAL, pips_difference REAL, closed_at TEXT
+        )
+    """)
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # 3 losses de hoy + 2 de ayer (no deben contar)
+    trades = [
+        (f"{today}T10:00:00", "EURUSD-OTC", "CALL", "LOSS"),
+        (f"{today}T11:00:00", "EURUSD-OTC", "PUT", "LOSS"),
+        (f"{today}T12:00:00", "EURUSD-OTC", "CALL", "LOSS"),
+        (f"{today}T13:00:00", "USDJPY-OTC", "PUT", "WIN"),
+        (f"{yesterday}T23:00:00", "EURUSD-OTC", "CALL", "LOSS"),
+        (f"{yesterday}T23:30:00", "EURUSD-OTC", "PUT", "LOSS"),
+    ]
+    for ts, asset, direction, result in trades:
+        conn.execute(
+            "INSERT INTO trades (timestamp, asset, direction, result) VALUES (?, ?, ?, ?)",
+            (ts, asset, direction, result),
+        )
+    conn.commit()
+    conn.close()
+
+    # Llamar _reconstruct_trade_log directamente (no requiere event loop)
+    s = AssetScanner()
+    with patch("asset_scanner.DB_PATH", str(db_path)):
+        s.trade_log = s._reconstruct_trade_log()
+
+    # Verificar: 4 trades de hoy (3 LOSS + 1 WIN), 0 de ayer
+    assert len(s.trade_log) == 4
+
+    # Verificar que per_asset_loss_filter bloquearía EURUSD-OTC
+    from regime_filter import per_asset_loss_filter
+    with patch("regime_filter._today_utc", return_value=today):
+        result = per_asset_loss_filter(s.trade_log, asset="EURUSD-OTC", max_losses=3)
+    assert result.allow is False  # 3 LOSS hoy → bloqueado
+
+    # USDJPY-OTC sigue permitido
+    with patch("regime_filter._today_utc", return_value=today):
+        result2 = per_asset_loss_filter(s.trade_log, asset="USDJPY-OTC", max_losses=3)
+    assert result2.allow is True

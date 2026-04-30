@@ -11,6 +11,42 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 1.2 — Stop Loss dual por activo + global (2026-04-30)
+
+### Cambios en `regime_filter.py`
+- Nueva constante `MAX_ASSET_DAILY_LOSSES = 3` (pérdidas máximas por activo en sesión UTC).
+- `MAX_DAILY_LOSSES` subido de 3 → 6 (halt global).
+- Nuevo filtro `per_asset_loss_filter(trade_log, asset, max_losses)`: bloquea un activo individual sin detener el bot. Usa `_today_utc()` para reset a 00:00 UTC.
+- Insertado en `check_all_filters` como filtro #4 (después de `blocked_asset`, antes de `daily_loss`).
+- Nuevo parámetro `max_asset_losses` en firma de `check_all_filters`.
+
+### Cambios en `asset_scanner.py`
+- Nuevo método `_reconstruct_trade_log()`: al startup, query a la BD para recuperar trades del día UTC actual. Mitiga vulnerabilidad post-restart donde `trade_log = []` permitiría violar los stop loss.
+- Logging de seguridad en `logs/security_halts.log` si la reconstrucción falla (fail-open con auditoría).
+- `start()`: `self.trade_log = self._reconstruct_trade_log()` en vez de `= []`.
+- Loop de candidatos: `if not self.running: break` — previene ejecución de candidatos adicionales tras auto_shutdown a mitad de ciclo.
+
+### Decisiones arquitectónicas
+- **Estado en memoria + reconstrucción BD**: filtros stateless consultan `trade_log` cada vez. Al startup se reconstruye desde BD. Sin persistencia separada de `asset_halted`.
+- **Reset diario**: Solo al startup (OPCIÓN 1). Los filtros auto-filtran por fecha UTC.
+- **Coexistencia**: `per_asset_loss_filter` (3/activo, bloquea activo), `daily_loss_filter` (6 globales, halt total), `consecutive_loss_filter` (3 racha, halt total) — 3 filtros independientes sin conflicto.
+
+### Observaciones para tareas futuras
+- Si `MAX_TRADES_PER_DAY` se sube >30, revisar el cap de 50 en `trade_log` (línea 660).
+- Política TIE en racha consecutiva (Tarea 1.3) afectará trades reconstruidos — pero la política se aplica desde el filtro, así que es uniforme.
+
+### Tests añadidos (8)
+1. `test_per_asset_3_losses_blocks_that_asset` — 3 LOSS → bloquea asset
+2. `test_per_asset_block_allows_other_assets` — 3 LOSS en EURUSD → USDJPY OK
+3. `test_global_6_losses_triggers_shutdown` — 6 LOSS distribuidas → halt global
+4. `test_global_halt_not_triggered_below_6` — 5 LOSS → no halt
+5. `test_per_asset_reset_at_utc_midnight` — LOSS de ayer no cuentan
+6. `test_per_asset_and_global_coexist` — per-asset y global funcionan juntos
+7. `test_scanner_stops_processing_after_halt` — halt a mitad de ciclo → stop
+8. `test_scanner_reconstructs_trade_log_from_db` — startup reconstruye contadores
+
+---
+
 ## Tarea 1.0 — Integrar check_all_filters en asset_scanner (2026-04-30)
 
 ### Hallazgo crítico (Escenario B)

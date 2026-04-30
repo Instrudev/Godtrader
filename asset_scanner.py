@@ -22,9 +22,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import sqlite3
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -127,7 +129,6 @@ class AssetScanner:
         self.total_scans     = 0
         self.signals_found   = 0
         self.trades_executed = 0
-        self.trade_log       = []
         self.last_scan_result = []
         self.last_scan_time  = None
 
@@ -135,6 +136,7 @@ class AssetScanner:
             ml_classifier.load()
 
         init_db(DB_PATH)
+        self.trade_log = self._reconstruct_trade_log()
         self._task = asyncio.create_task(self._scan_loop())
 
         logger.info("=" * 60)
@@ -159,6 +161,65 @@ class AssetScanner:
             f"[SCANNER] DETENIDO | Scans={self.total_scans} | "
             f"Señales={self.signals_found} | Trades={self.trades_executed}"
         )
+
+    def _reconstruct_trade_log(self) -> List[Dict]:
+        """
+        Reconstruye trade_log desde la BD con trades del día UTC actual.
+
+        Mitiga la vulnerabilidad post-restart: si el bot se reinicia tras
+        acumular pérdidas, los contadores de daily_loss y per_asset_loss
+        se reconstruyen correctamente desde la fuente de verdad (BD).
+        """
+        try:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT timestamp, asset, direction, result
+                    FROM trades
+                    WHERE timestamp >= ? AND timestamp < ?
+                      AND result IN ('WIN', 'LOSS', 'TIE')
+                    ORDER BY timestamp ASC
+                    """,
+                    (today, tomorrow),
+                ).fetchall()
+
+            records = [
+                {
+                    "timestamp": row["timestamp"],
+                    "asset":     row["asset"],
+                    "direction": row["direction"],
+                    "result":    row["result"],
+                }
+                for row in rows
+            ]
+            logger.info(
+                f"[SCANNER] Reconstruyendo trade_log desde BD: "
+                f"{len(records)} trades del día UTC actual ({today}) cargados."
+            )
+            return records
+
+        except Exception as e:
+            logger.error(
+                f"[SCANNER] Could not reconstruct trade_log: {e}. "
+                "Daily limits may be incorrect."
+            )
+            # Log de seguridad para auditoría
+            try:
+                from iqservice import _security_logger
+                ts = datetime.now(timezone.utc).isoformat()
+                _security_logger.warning(
+                    f"[{ts}] HALT_TYPE=TRADE_LOG_RECONSTRUCTION_FAILED "
+                    f"exception={type(e).__name__}: {e} "
+                    f"impact=Daily limits may be incorrect until next successful startup "
+                    f"action_required=Manual verification of daily loss counters"
+                )
+            except Exception:
+                pass
+            return []
 
     def get_status(self) -> Dict:
         wins  = sum(1 for t in self.trade_log if t.get("result") == "WIN")
@@ -287,6 +348,8 @@ class AssetScanner:
 
                 # Ejecutar el mejor candidato (fallback a 2do, 3ro...)
                 for candidate in qualified:
+                    if not self.running:
+                        break
                     executed = await asyncio.to_thread(self._try_execute, candidate)
                     if executed:
                         self.trades_executed += 1

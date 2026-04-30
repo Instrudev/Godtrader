@@ -495,3 +495,94 @@ def test_max_trades_filter_uses_utc() -> None:
         result = max_trades_filter(log, max_trades=2)
     # Solo 1 trade hoy UTC → no bloquea
     assert result.allow is True
+
+
+# ─── Tarea 1.2: Stop Loss dual (per-asset + global) ─────────────────────────
+
+def test_per_asset_3_losses_blocks_that_asset() -> None:
+    """3 LOSS en EURUSD-OTC hoy → bloquea EURUSD-OTC."""
+    from regime_filter import per_asset_loss_filter
+    log = [
+        {"result": "LOSS", "asset": "EURUSD-OTC", "timestamp": "2026-04-30T10:00:00"},
+        {"result": "LOSS", "asset": "EURUSD-OTC", "timestamp": "2026-04-30T11:00:00"},
+        {"result": "LOSS", "asset": "EURUSD-OTC", "timestamp": "2026-04-30T12:00:00"},
+    ]
+    with patch("regime_filter._today_utc", return_value="2026-04-30"):
+        result = per_asset_loss_filter(log, asset="EURUSD-OTC", max_losses=3)
+    assert result.allow is False
+    assert result.filter_name == "per_asset_loss_filter"
+    assert "EURUSD-OTC" in result.reason
+    assert result.auto_shutdown is False  # NO halt total
+
+
+def test_per_asset_block_allows_other_assets() -> None:
+    """3 LOSS en EURUSD-OTC → USDJPY-OTC sigue permitido."""
+    from regime_filter import per_asset_loss_filter
+    log = [
+        {"result": "LOSS", "asset": "EURUSD-OTC", "timestamp": "2026-04-30T10:00:00"},
+        {"result": "LOSS", "asset": "EURUSD-OTC", "timestamp": "2026-04-30T11:00:00"},
+        {"result": "LOSS", "asset": "EURUSD-OTC", "timestamp": "2026-04-30T12:00:00"},
+    ]
+    with patch("regime_filter._today_utc", return_value="2026-04-30"):
+        result = per_asset_loss_filter(log, asset="USDJPY-OTC", max_losses=3)
+    assert result.allow is True  # USDJPY no tiene pérdidas
+
+
+def test_global_6_losses_triggers_shutdown() -> None:
+    """6 LOSS distribuidas entre activos → halt global."""
+    log = [
+        {"result": "LOSS", "asset": f"ASSET{i}-OTC", "timestamp": "2026-04-30T10:00:00"}
+        for i in range(6)
+    ]
+    with patch("regime_filter._today_utc", return_value="2026-04-30"):
+        result = daily_loss_filter(log, max_daily_losses=6)
+    assert result.allow is False
+    assert result.auto_shutdown is True
+
+
+def test_global_halt_not_triggered_below_6() -> None:
+    """5 LOSS distribuidas → NO halt global."""
+    log = [
+        {"result": "LOSS", "asset": f"ASSET{i}-OTC", "timestamp": "2026-04-30T10:00:00"}
+        for i in range(5)
+    ]
+    with patch("regime_filter._today_utc", return_value="2026-04-30"):
+        result = daily_loss_filter(log, max_daily_losses=6)
+    assert result.allow is True
+
+
+def test_per_asset_reset_at_utc_midnight() -> None:
+    """LOSS de ayer no cuentan para el bloqueo de hoy."""
+    from regime_filter import per_asset_loss_filter
+    log = [
+        {"result": "LOSS", "asset": "EURUSD-OTC", "timestamp": "2026-04-29T22:00:00"},
+        {"result": "LOSS", "asset": "EURUSD-OTC", "timestamp": "2026-04-29T23:00:00"},
+        {"result": "LOSS", "asset": "EURUSD-OTC", "timestamp": "2026-04-29T23:55:00"},
+    ]
+    with patch("regime_filter._today_utc", return_value="2026-04-30"):
+        result = per_asset_loss_filter(log, asset="EURUSD-OTC", max_losses=3)
+    # Las 3 pérdidas son de ayer → hoy tiene 0 → no bloquea
+    assert result.allow is True
+
+
+def test_per_asset_and_global_coexist() -> None:
+    """3 en un activo bloquea ese activo; el conteo global sigue acumulando."""
+    from regime_filter import per_asset_loss_filter
+    log = [
+        {"result": "LOSS", "asset": "EURUSD-OTC", "timestamp": "2026-04-30T10:00:00"},
+        {"result": "LOSS", "asset": "EURUSD-OTC", "timestamp": "2026-04-30T11:00:00"},
+        {"result": "LOSS", "asset": "EURUSD-OTC", "timestamp": "2026-04-30T12:00:00"},
+        {"result": "LOSS", "asset": "USDJPY-OTC", "timestamp": "2026-04-30T13:00:00"},
+    ]
+    with patch("regime_filter._today_utc", return_value="2026-04-30"):
+        # EURUSD bloqueado por per_asset
+        asset_result = per_asset_loss_filter(log, asset="EURUSD-OTC", max_losses=3)
+        assert asset_result.allow is False
+
+        # USDJPY sigue OK por per_asset
+        other_result = per_asset_loss_filter(log, asset="USDJPY-OTC", max_losses=3)
+        assert other_result.allow is True
+
+        # Global: 4 losses → no halt (< 6)
+        global_result = daily_loss_filter(log, max_daily_losses=6)
+        assert global_result.allow is True

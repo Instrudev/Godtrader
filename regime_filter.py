@@ -46,7 +46,8 @@ ATR_PERIOD             = 14
 ATR_PERCENTILE_LOW     = 30     # bloquear si ATR está por debajo de este percentil
 ATR_PERCENTILE_HIGH    = 95     # bloquear si ATR está por encima de este percentil
 MIN_PAYOUT             = 0.80   # payout mínimo del par para operar
-MAX_DAILY_LOSSES       = 3      # pérdidas diarias máximas (auto-shutdown)
+MAX_ASSET_DAILY_LOSSES = 3      # pérdidas máximas por activo individual en sesión UTC
+MAX_DAILY_LOSSES       = 6      # pérdidas globales máximas (auto-shutdown) — subido de 3
 MAX_CONSECUTIVE_LOSSES = 3      # pérdidas consecutivas máximas (auto-shutdown)
 MAX_TRADES_PER_DAY     = 15    # operaciones diarias máximas
 BLOCKED_HOURS          = frozenset({0, 1, 2, 3, 14})   # horas UTC con winrate < 40%
@@ -355,6 +356,40 @@ def blocked_asset_filter(asset: str) -> FilterResult:
     return FilterResult.ok()
 
 
+# ─── 8b. Filtro de pérdidas por activo ───────────────────────────────────────
+
+def per_asset_loss_filter(
+    trade_log: List[Dict],
+    asset: str,
+    max_losses: int = MAX_ASSET_DAILY_LOSSES,
+) -> FilterResult:
+    """
+    Bloquea un activo si acumuló >= max_losses pérdidas hoy (UTC).
+
+    A diferencia de daily_loss_filter (global, auto_shutdown), este filtro
+    solo bloquea el activo individual. El bot sigue operando otros pares.
+    El conteo se resetea a 00:00 UTC (SESSION_RESET_TIMEZONE).
+    """
+    today = _today_utc()
+    losses = sum(
+        1
+        for t in trade_log
+        if t.get("result") == "LOSS"
+        and t.get("asset") == asset
+        and str(t.get("timestamp", ""))[:10] == today
+    )
+    if losses >= max_losses:
+        logger.info(
+            f"[PER_ASSET_LOSS] {asset}: {losses} pérdidas hoy (UTC: {today}) "
+            f"≥ límite {max_losses}. Activo bloqueado para el resto del día."
+        )
+        return FilterResult.block(
+            "per_asset_loss_filter",
+            f"{asset}: {losses} pérdidas hoy (UTC) ≥ límite {max_losses}. Activo bloqueado.",
+        )
+    return FilterResult.ok()
+
+
 def min_streak_filter(df: pd.DataFrame) -> FilterResult:
     """Bloquea si la señal viene de una racha de 1-2 velas (sin edge demostrado)."""
     try:
@@ -447,6 +482,7 @@ def check_all_filters(
     direction: Optional[str] = None,
     min_winrate: float = MIN_WINRATE_HOURLY,
     min_payout: float = MIN_PAYOUT,
+    max_asset_losses: int = MAX_ASSET_DAILY_LOSSES,
     max_daily_losses: int = MAX_DAILY_LOSSES,
     max_consecutive: int = MAX_CONSECUTIVE_LOSSES,
     max_trades: int = MAX_TRADES_PER_DAY,
@@ -459,16 +495,16 @@ def check_all_filters(
       1. Hora bloqueada (instantáneo)
       2. Día bloqueado (instantáneo)
       3. Activo bloqueado (instantáneo)
-      4. Pérdidas diarias (auto-shutdown, barato)
-      5. Pérdidas consecutivas (auto-shutdown, barato)
-      6. Máximo de operaciones diarias (barato)
-      7. Drift del generador (archivo en disco, barato)
-      8. Perfil horario (DB, medio)
-      9. Perfil por día de semana (DB, medio)
-     10. Volatilidad / ATR (cálculo numérico, medio)
-     11. Payout (valor pasado como parámetro, barato)
-     12. Racha mínima (cálculo, medio)
-     13. Patrón de pérdida (DB, medio)
+      4. Pérdidas por activo (bloquea solo ese activo, barato)
+      5. Pérdidas diarias globales (auto-shutdown, barato)
+      6. Pérdidas consecutivas (auto-shutdown, barato)
+      8. Drift del generador (archivo en disco, barato)
+      9. Perfil horario (DB, medio)
+     10. Perfil por día de semana (DB, medio)
+     11. Volatilidad / ATR (cálculo numérico, medio)
+     12. Payout (valor pasado como parámetro, barato)
+     13. Racha mínima (cálculo, medio)
+     14. Patrón de pérdida (DB, medio)
     """
     now_utc = datetime.now(timezone.utc)
 
@@ -476,6 +512,7 @@ def check_all_filters(
         lambda: blocked_hours_filter(now_utc.hour),
         lambda: blocked_weekday_filter(now_utc.weekday()),
         lambda: blocked_asset_filter(asset),
+        lambda: per_asset_loss_filter(trade_log, asset, max_asset_losses),
         lambda: daily_loss_filter(trade_log, max_daily_losses),
         lambda: consecutive_loss_filter(trade_log, max_consecutive),
         lambda: max_trades_filter(trade_log, max_trades),
