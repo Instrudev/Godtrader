@@ -1,10 +1,9 @@
 """
-tests/test_scanner_filters.py – Tests de integración de filtros en asset_scanner (Tarea 1.0).
+tests/test_scanner_filters.py – Tests de integración de filtros y estrategias en asset_scanner.
 
-Valida que check_all_filters está correctamente integrado en _try_execute()
-y que los 13 filtros de régimen se evalúan antes de ML.
-
-6 tests.
+Tarea 1.0: check_all_filters integrado (6 tests).
+Tarea 1.2: halt + reconstrucción trade_log (2 tests).
+Tarea 1.4: _evaluate_strategies paralelo + arbitraje (10 tests).
 """
 from __future__ import annotations
 
@@ -300,3 +299,178 @@ def test_scanner_reconstructs_trade_log_from_db(tmp_path):
     with patch("regime_filter._today_utc", return_value=today):
         result2 = per_asset_loss_filter(s.trade_log, asset="USDJPY-OTC", max_losses=3)
     assert result2.allow is True
+
+
+# ─── Tarea 1.4: _evaluate_strategies (paralelo + arbitraje) ──────────────────
+
+def _make_df_with_indicators(**overrides):
+    """Crea DataFrame mínimo con indicadores para _evaluate_strategies."""
+    n = 50
+    np.random.seed(42)
+    prices = 1.1000 + np.random.randn(n).cumsum() * 0.0001
+    defaults = {
+        "rsi": 50.0, "bb_upper": 1.1010, "bb_mid": 1.1000,
+        "bb_lower": 1.0990, "bb_width": 0.5, "vol_rel": 1.0,
+    }
+    defaults.update(overrides)
+    return pd.DataFrame({
+        "open": prices, "close": prices,
+        "high": prices + 0.0002, "low": prices - 0.0002,
+        "volume": [100] * n,
+        "time": pd.date_range("2026-04-30 10:00", periods=n, freq="1min"),
+        "rsi": [defaults["rsi"]] * n,
+        "bb_upper": [defaults["bb_upper"]] * n,
+        "bb_mid": [defaults["bb_mid"]] * n,
+        "bb_lower": [defaults["bb_lower"]] * n,
+        "bb_width": [defaults["bb_width"]] * n,
+        "vol_rel": [defaults["vol_rel"]] * n,
+        "ema20": prices, "ema200": prices,
+        "rel_atr": [1.0] * n,
+    })
+
+
+def test_no_strategies_active_returns_none():
+    """Ninguna estrategia activa → (None, 0.0, _, 'no_signal')."""
+    from asset_scanner import _evaluate_strategies
+    df = _make_df_with_indicators(rsi=50.0)  # RSI neutral → no RSI signal
+
+    with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(False, None, "")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(False, "")), \
+         patch("asset_scanner.get_streak_info", return_value={"is_extreme": False, "percentile": 30, "current_length": 1, "direction": "bull"}):
+        direction, score, signals, resolution = _evaluate_strategies(df, asset="TEST")
+
+    assert direction is None
+    assert score == 0.0
+    assert resolution == "no_signal"
+    assert all(not s.active for s in signals)
+
+
+def test_single_strategy_returns_its_direction():
+    """Solo streak activa → retorna su dirección."""
+    from asset_scanner import _evaluate_strategies
+    df = _make_df_with_indicators(rsi=50.0)
+
+    with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(False, None, "")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(False, "")), \
+         patch("asset_scanner.get_streak_info", return_value={"is_extreme": True, "percentile": 85, "current_length": 5, "direction": "bear"}):
+        direction, score, signals, resolution = _evaluate_strategies(df, asset="TEST")
+
+    assert direction == "CALL"  # bear streak → CALL reversal
+    assert score > 0
+    assert resolution == "single_match"
+
+
+def test_multiple_same_direction_returns_highest_score():
+    """BB 2-Candle CALL + RSI Clásico CALL → CALL con mayor score."""
+    from asset_scanner import _evaluate_strategies
+    df = _make_df_with_indicators(rsi=20.0)  # RSI < 35 → CALL
+
+    with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(True, "CALL", "reason")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(False, "")), \
+         patch("asset_scanner.get_streak_info", return_value={"is_extreme": False, "percentile": 30, "current_length": 1, "direction": "bull"}):
+        direction, score, signals, resolution = _evaluate_strategies(df, asset="TEST")
+
+    assert direction == "CALL"
+    assert resolution == "multiple_match"
+    # Both active, winner is the one with highest score
+    active = [s for s in signals if s.active]
+    assert len(active) == 2
+    winner = max(active, key=lambda s: s.score)
+    assert score == winner.score  # returned score matches winner
+
+
+def test_contradictory_directions_returns_none():
+    """BB 2-Candle CALL + RSI Clásico PUT → conflict_cancel."""
+    from asset_scanner import _evaluate_strategies
+    df = _make_df_with_indicators(rsi=80.0)  # RSI > 65 → PUT
+
+    with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(True, "CALL", "reason")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(False, "")), \
+         patch("asset_scanner.get_streak_info", return_value={"is_extreme": False, "percentile": 30, "current_length": 1, "direction": "bull"}):
+        direction, score, signals, resolution = _evaluate_strategies(df, asset="TEST")
+
+    assert direction is None
+    assert score == 0.0
+    assert resolution == "conflict_cancel"
+
+
+def test_3_call_1_put_conflict_cancel():
+    """3 CALL + 1 PUT → conflict_cancel (mayoría NO gana)."""
+    from asset_scanner import _evaluate_strategies
+    df = _make_df_with_indicators(rsi=20.0)  # RSI < 35 → CALL
+
+    with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(True, "CALL", "reason")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(True, "reason")), \
+         patch("asset_scanner.get_streak_info", return_value={"is_extreme": True, "percentile": 85, "current_length": 5, "direction": "bear"}):
+        # bb_2candle=CALL, bb_body=PUT, streak=CALL (bear→CALL), rsi_classical=CALL
+        direction, score, signals, resolution = _evaluate_strategies(df, asset="TEST")
+
+    assert direction is None
+    assert resolution == "conflict_cancel"
+
+
+def test_score_from_winning_strategy():
+    """El score devuelto es exactamente el del ganador, no un max() agregado."""
+    from asset_scanner import _evaluate_strategies
+    df = _make_df_with_indicators(rsi=50.0)
+
+    with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(True, "PUT", "reason")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(False, "")), \
+         patch("asset_scanner.get_streak_info", return_value={"is_extreme": False, "percentile": 30, "current_length": 1, "direction": "bull"}):
+        direction, score, signals, resolution = _evaluate_strategies(df, asset="TEST")
+
+    assert direction == "PUT"
+    bb2_signal = [s for s in signals if s.strategy_name == "bb_2candle"][0]
+    assert score == bb2_signal.score
+
+
+def test_telemetry_single_match():
+    """resolution='single_match' cuando solo una estrategia activa."""
+    from asset_scanner import _evaluate_strategies
+    df = _make_df_with_indicators(rsi=50.0)
+
+    with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(True, "CALL", "reason")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(False, "")), \
+         patch("asset_scanner.get_streak_info", return_value={"is_extreme": False, "percentile": 30, "current_length": 1, "direction": "bull"}):
+        _, _, _, resolution = _evaluate_strategies(df, asset="TEST")
+
+    assert resolution == "single_match"
+
+
+def test_telemetry_conflict_cancel():
+    """resolution='conflict_cancel' cuando hay direcciones opuestas."""
+    from asset_scanner import _evaluate_strategies
+    df = _make_df_with_indicators(rsi=80.0)
+
+    with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(True, "CALL", "reason")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(False, "")), \
+         patch("asset_scanner.get_streak_info", return_value={"is_extreme": False, "percentile": 30, "current_length": 1, "direction": "bull"}):
+        _, _, _, resolution = _evaluate_strategies(df, asset="TEST")
+
+    assert resolution == "conflict_cancel"
+
+
+def test_strategy_signal_frozen():
+    """StrategySignal es inmutable (frozen dataclass)."""
+    from asset_scanner import StrategySignal
+    sig = StrategySignal(active=True, direction="CALL", score=0.75, strategy_name="test")
+    with pytest.raises(AttributeError):
+        sig.score = 0.99  # type: ignore
+
+
+def test_backwards_compatible_signature():
+    """_evaluate_strategies retorna tupla de 4 elementos compatible con callsites."""
+    from asset_scanner import _evaluate_strategies
+    df = _make_df_with_indicators(rsi=50.0)
+
+    with patch("asset_scanner.detect_bb_two_candle_reversal", return_value=(False, None, "")), \
+         patch("asset_scanner.detect_bb_body_reversal", return_value=(False, "")), \
+         patch("asset_scanner.get_streak_info", return_value={"is_extreme": False, "percentile": 30, "current_length": 1, "direction": "bull"}):
+        result = _evaluate_strategies(df, asset="TEST")
+
+    assert len(result) == 4
+    direction, score, signals, resolution = result
+    assert direction is None or direction in ("CALL", "PUT")
+    assert isinstance(score, float)
+    assert isinstance(signals, list)
+    assert resolution in ("single_match", "multiple_match", "conflict_cancel", "no_signal")

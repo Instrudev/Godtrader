@@ -11,6 +11,49 @@ Baseline de remediación: **250 passed, 3 known failures**. Cualquier fallo adic
 
 ---
 
+## Tarea 1.4 — Refactorizar lógica de decisión de dirección (2026-04-30)
+
+### Problema resuelto
+`_infer_direction()` era cascada con return temprano: la primera estrategia que matcheaba decidía dirección, ignorando señales contradictorias y sesgando hacia BB 2-Candle. `_score_signal()` evaluaba las mismas 4 estrategias por separado, duplicando cómputo.
+
+### Cambios en `asset_scanner.py`
+- **Eliminados**: `_infer_direction()` y `_score_signal()` (consolidados).
+- **Nuevo**: `_evaluate_strategies(df, asset)` — evalúa las 4 estrategias en paralelo, retorna `(direction, score, signals, resolution)`.
+- **Nuevo**: `StrategySignal` frozen dataclass: `(active, direction, score, strategy_name)`.
+- **Arbitraje de conflictos**:
+  - Todas mismas dirección → `single_match` o `multiple_match` (mayor score gana).
+  - Direcciones opuestas → `conflict_cancel` (no opera). Mayoría no gana.
+  - Sin señales → `no_signal`.
+- **~2x speedup**: cada detector se llama 1 vez en vez de 2 por activo.
+- **Telemetría por instancia**: `self._strategy_telemetry` con contadores diarios, reset a 00:00 UTC, `get_strategy_telemetry()`.
+- **Log JSONL**: `logs/strategy_decisions.log` — bitácora exhaustiva de todas las evaluaciones.
+- **Callsites actualizados**: `_scan_one` y `_confirm_hot` usan `_evaluate_strategies`. `_try_execute` actualiza contadores desde `candidate["resolution"]`.
+
+### Fórmulas de scoring preservadas
+Las 4 fórmulas matemáticas se copiaron literalmente de `_score_signal`. Cero cambios a la lógica de scoring.
+- BB 2-Candle: `0.70 + min(rsi_extremity, 1.0) * 0.25` (rango 0.70–0.95)
+- BB Body: `0.50 + ext*0.28 + rsi_f*0.15 + vol_f` (rango 0.50–0.78)
+- Streak: `pct_f*0.75 + len_f*0.25` (rango 0.56–0.75)
+- RSI Clásico: `0.40 + rsi_f*0.30 + bb_f*0.30` (rango 0.40–0.70)
+
+### Tests añadidos (10) — `tests/test_scanner_filters.py`
+1. `test_no_strategies_active_returns_none`
+2. `test_single_strategy_returns_its_direction`
+3. `test_multiple_same_direction_returns_highest_score`
+4. `test_contradictory_directions_returns_none`
+5. `test_3_call_1_put_conflict_cancel` (mayoría no gana)
+6. `test_score_from_winning_strategy`
+7. `test_telemetry_single_match`
+8. `test_telemetry_conflict_cancel`
+9. `test_strategy_signal_frozen`
+10. `test_backwards_compatible_signature`
+
+### Notas
+- RSI usa 35/65 (main HEAD). Tarea 2.2 los cambiará.
+- BB Body usa `bb_mid` (main HEAD). Tarea 2.3 lo evaluará.
+
+---
+
 ## Tarea 1.3 — Política de TIE en rachas consecutivas (2026-04-30)
 
 ### Política definida

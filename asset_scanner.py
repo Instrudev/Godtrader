@@ -20,14 +20,17 @@ Flujo por ciclo:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import random
 import sqlite3
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -48,6 +51,30 @@ from ml_classifier import ml_classifier, extract_features
 from regime_filter import check_all_filters
 
 logger = logging.getLogger(__name__)
+
+# ─── Logger JSONL para decisiones de estrategia ──────────────────────────────
+
+_decision_logger = logging.getLogger("strategy_decisions")
+_decision_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_decision_log_dir, exist_ok=True)
+_decision_handler = logging.FileHandler(
+    os.path.join(_decision_log_dir, "strategy_decisions.log"), encoding="utf-8"
+)
+_decision_handler.setFormatter(logging.Formatter("%(message)s"))
+_decision_logger.addHandler(_decision_handler)
+_decision_logger.setLevel(logging.INFO)
+
+
+# ─── Señal de estrategia ─────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class StrategySignal:
+    """Resultado de evaluación de una estrategia individual."""
+    active: bool
+    direction: Optional[str]   # "CALL" | "PUT" | None
+    score: float
+    strategy_name: str
+
 
 # ─── Constantes ───────────────────────────────────────────────────────────────
 
@@ -94,6 +121,7 @@ class AssetScanner:
         # Stats
         self.total_scans: int = 0
         self.signals_found: int = 0
+        self._strategy_telemetry: Dict[str, int] = self._fresh_telemetry()
         self.trades_executed: int = 0
         self.trade_log: List[Dict] = []
         self.last_scan_result: List[Dict] = []
@@ -243,6 +271,30 @@ class AssetScanner:
             },
             "trade_log": self.trade_log[-20:],
         }
+
+    # ─── Telemetría de estrategias ───────────────────────────────────────────
+
+    @staticmethod
+    def _fresh_telemetry() -> Dict[str, int]:
+        from regime_filter import _today_utc
+        return {
+            "single_match": 0, "multiple_match": 0,
+            "conflict_cancel": 0, "no_signal": 0,
+            "session_date_utc": _today_utc(),
+        }
+
+    def _check_telemetry_reset(self) -> None:
+        """Resetea contadores si el día UTC cambió."""
+        from regime_filter import _today_utc
+        today = _today_utc()
+        if self._strategy_telemetry.get("session_date_utc") != today:
+            logger.info(f"[TELEMETRY] Nuevo día UTC ({today}). Reseteando contadores.")
+            self._strategy_telemetry = self._fresh_telemetry()
+
+    def get_strategy_telemetry(self) -> Dict:
+        """Snapshot de telemetría de estrategias del día actual."""
+        self._check_telemetry_reset()
+        return dict(self._strategy_telemetry)
 
     # ─── Bucle principal ──────────────────────────────────────────────────────
 
@@ -402,13 +454,13 @@ class AssetScanner:
                     base["reason"] = reason
                     return base
 
-                direction = _infer_direction(df)
-                score = _score_signal(df)
+                direction, score, _sigs, resolution = _evaluate_strategies(df, asset=asset)
 
                 return {
                     "asset": asset, "qualifies": True,
                     "reason": reason, "score": score,
                     "df": df, "direction": direction,
+                    "resolution": resolution,
                 }
             except Exception as e:
                 logger.warning(f"  {asset}: error en confirmación → {e}")
@@ -552,8 +604,7 @@ class AssetScanner:
                 base["reason"] = reason
                 return base
 
-            direction = _infer_direction(df)
-            score     = _score_signal(df)
+            direction, score, _sigs, resolution = _evaluate_strategies(df, asset=asset)
 
             logger.info(
                 f"  {asset}: ✓ dir={direction} score={score:.3f} | {reason[:55]}"
@@ -565,6 +616,7 @@ class AssetScanner:
                 "score":     score,
                 "df":        df,
                 "direction": direction,
+                "resolution": resolution,
             }
 
         except Exception as e:
@@ -591,8 +643,14 @@ class AssetScanner:
         df        = candidate["df"]
         direction = candidate["direction"]
 
+        # ── Telemetría de estrategias (solo en flujo de decisión final) ───────
+        self._check_telemetry_reset()
+        resolution = candidate.get("resolution", "no_signal")
+        if resolution in self._strategy_telemetry:
+            self._strategy_telemetry[resolution] += 1
+
         if direction is None:
-            logger.info(f"[SCANNER] {asset}: dirección indeterminada. Skip.")
+            logger.info(f"[SCANNER] {asset}: dirección indeterminada ({resolution}). Skip.")
             return False
 
         # ── Contexto de mercado (requerido por filtros Y por persistencia) ────
@@ -1002,55 +1060,25 @@ class AssetScanner:
             asyncio.run_coroutine_threadsafe(coro, self.loop)
 
 
-# ─── Helpers de señal ─────────────────────────────────────────────────────────
+# ─── Evaluación consolidada de estrategias ───────────────────────────────────
 
-def _infer_direction(df: pd.DataFrame) -> Optional[str]:
+def _evaluate_strategies(
+    df: pd.DataFrame,
+    asset: str = "",
+) -> Tuple[Optional[str], float, List[StrategySignal], str]:
     """
-    Infiere la dirección esperada (PUT/CALL) desde los indicadores.
+    Evalúa las 4 estrategias en paralelo y aplica arbitraje de conflictos.
 
-    Prioridad:
-      1. bb_2candle_reversal → CALL o PUT (2 velas fuera de BB)
-      2. bb_body_reversal    → siempre PUT
-      3. Racha extrema       → reversión (bear→CALL, bull→PUT)
-      4. RSI clásico         → <35 CALL, >65 PUT
-    """
-    last = df.iloc[-1]
-    rsi  = float(last["rsi"])
+    Reemplaza _infer_direction (cascada) + _score_signal (duplicación).
+    Cada estrategia se evalúa independientemente. Si hay conflicto de
+    dirección, se cancela la operación.
 
-    # 1. bb_2candle_reversal → CALL o PUT
-    bb2_ok, bb2_dir, _ = detect_bb_two_candle_reversal(df)
-    if bb2_ok and bb2_dir:
-        return bb2_dir
-
-    # 2. bb_body_reversal → siempre PUT
-    ok, _ = detect_bb_body_reversal(df)
-    if ok:
-        return "PUT"
-
-    # 3. Racha extrema → reversión
-    streak = get_streak_info(df)
-    if streak["is_extreme"]:
-        return "CALL" if streak["direction"] == "bear" else "PUT"
-
-    # 3. RSI clásico
-    if rsi < 35:
-        return "CALL"
-    if rsi > 65:
-        return "PUT"
-
-    return None
-
-
-def _score_signal(df: pd.DataFrame) -> float:
-    """
-    Puntúa la fuerza de la señal en [0.0, 1.0]. Mayor = mejor candidato.
-
-    Permite comparar señales de distintos activos y elegir el más fuerte.
-
-    Componentes:
-      - bb_body_reversal: extensión sobre umbral + RSI + volumen
-      - Racha extrema:    percentil + longitud de racha
-      - RSI clásico:      distancia del RSI al neutro + posición en BB
+    Returns:
+        (direction, score, signals, resolution)
+        - direction: "CALL"/"PUT" o None si conflicto/nada activo
+        - score: score del ganador (0.0 si None)
+        - signals: lista completa de StrategySignal para auditoría
+        - resolution: "single_match" | "multiple_match" | "conflict_cancel" | "no_signal"
     """
     last    = df.iloc[-1]
     rsi     = float(last["rsi"])
@@ -1061,16 +1089,21 @@ def _score_signal(df: pd.DataFrame) -> float:
     bb_low  = float(last["bb_lower"])
     bb_rng  = bb_up - bb_low
     vol_rel = float(last.get("vol_rel", 1.0))
-    score   = 0.0
 
-    # ── bb_2candle_reversal (máxima prioridad) ──────────────────────────────
+    signals: List[StrategySignal] = []
+
+    # ── 1. BB 2-Candle Reversal ──────────────────────────────────────────────
     bb2_ok, bb2_dir, _ = detect_bb_two_candle_reversal(df)
-    if bb2_ok:
-        # Score alto: base 0.70 + bonus por RSI extremo
+    if bb2_ok and bb2_dir:
         rsi_extremity = (35 - rsi) / 35 if rsi < 35 else (rsi - 65) / 35 if rsi > 65 else 0.0
-        score = max(score, 0.70 + min(rsi_extremity, 1.0) * 0.25)
+        s = round(min(0.70 + min(rsi_extremity, 1.0) * 0.25, 1.0), 4)
+        signals.append(StrategySignal(True, bb2_dir, s, "bb_2candle"))
+    else:
+        signals.append(StrategySignal(False, None, 0.0, "bb_2candle"))
 
-    # ── bb_body_reversal ──────────────────────────────────────────────────────
+    # ── 2. BB Body Reversal ──────────────────────────────────────────────────
+    bb_body_active = False
+    bb_body_score = 0.0
     body = price - open_
     if body > 0:
         threshold = open_ + body * 0.10
@@ -1078,27 +1111,97 @@ def _score_signal(df: pd.DataFrame) -> float:
             ext   = min((threshold - bb_mid) / body, 1.0)
             rsi_f = max(0.0, (rsi - 55) / 45)
             vol_f = min(max(vol_rel - 1.0, 0.0), 1.0) * 0.10
-            score = max(score, 0.50 + ext * 0.28 + rsi_f * 0.15 + vol_f)
+            bb_body_score = round(min(0.50 + ext * 0.28 + rsi_f * 0.15 + vol_f, 1.0), 4)
+            bb_body_active = True
+    # Also check via the formal detector for filter validation (RSI>55, bb_width, vol_rel)
+    ok_formal, _ = detect_bb_body_reversal(df)
+    if ok_formal:
+        bb_body_active = True
+        if bb_body_score == 0.0:
+            bb_body_score = 0.50
+    signals.append(StrategySignal(bb_body_active, "PUT" if bb_body_active else None, bb_body_score, "bb_body"))
 
-    # ── Racha extrema ─────────────────────────────────────────────────────────
+    # ── 3. Streak Reversal ───────────────────────────────────────────────────
     streak = get_streak_info(df)
     if streak["is_extreme"]:
         pct_f = streak["percentile"] / 100
         len_f = min(streak["current_length"], 8) / 8
-        score = max(score, pct_f * 0.75 + len_f * 0.25)
+        s = round(min(pct_f * 0.75 + len_f * 0.25, 1.0), 4)
+        streak_dir = "CALL" if streak["direction"] == "bear" else "PUT"
+        signals.append(StrategySignal(True, streak_dir, s, "streak"))
+    else:
+        signals.append(StrategySignal(False, None, 0.0, "streak"))
 
-    # ── RSI clásico + BB ──────────────────────────────────────────────────────
+    # ── 4. RSI Clásico + BB ──────────────────────────────────────────────────
     pct_b = (price - bb_low) / bb_rng if bb_rng > 1e-10 else 0.5
     if rsi < 35:
         rsi_f = (35 - rsi) / 35
         bb_f  = max(0.0, 0.20 - pct_b) / 0.20
-        score = max(score, 0.40 + rsi_f * 0.30 + bb_f * 0.30)
+        s = round(min(0.40 + rsi_f * 0.30 + bb_f * 0.30, 1.0), 4)
+        signals.append(StrategySignal(True, "CALL", s, "rsi_classical"))
     elif rsi > 65:
         rsi_f = (rsi - 65) / 35
         bb_f  = max(0.0, pct_b - 0.80) / 0.20
-        score = max(score, 0.40 + rsi_f * 0.30 + bb_f * 0.30)
+        s = round(min(0.40 + rsi_f * 0.30 + bb_f * 0.30, 1.0), 4)
+        signals.append(StrategySignal(True, "PUT", s, "rsi_classical"))
+    else:
+        signals.append(StrategySignal(False, None, 0.0, "rsi_classical"))
 
-    return round(min(score, 1.0), 4)
+    # ── Arbitraje ────────────────────────────────────────────────────────────
+    active = [s for s in signals if s.active]
+
+    if not active:
+        resolution = "no_signal"
+        direction, winner_score = None, 0.0
+    else:
+        directions = {s.direction for s in active}
+        if len(directions) == 1:
+            winner = max(active, key=lambda s: s.score)
+            resolution = "single_match" if len(active) == 1 else "multiple_match"
+            direction, winner_score = winner.direction, winner.score
+        else:
+            resolution = "conflict_cancel"
+            direction, winner_score = None, 0.0
+
+    # ── Log JSONL ────────────────────────────────────────────────────────────
+    try:
+        winner_data = None
+        if direction is not None:
+            w = max(active, key=lambda s: s.score)
+            winner_data = {"strategy": w.strategy_name, "direction": w.direction, "score": w.score}
+
+        entry = {
+            "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "asset": asset,
+            "resolution": resolution,
+            "active_count": len(active),
+            "winner": winner_data,
+            "all_signals": [
+                {"strategy": s.strategy_name, "active": s.active,
+                 "direction": s.direction, "score": s.score}
+                for s in signals
+            ],
+            "conflict_detail": (
+                ", ".join(f"{s.strategy_name}={s.direction}" for s in active)
+                if resolution == "conflict_cancel" else None
+            ),
+        }
+        _decision_logger.info(json.dumps(entry, separators=(",", ":")))
+    except Exception:
+        pass
+
+    # ── Log principal ────────────────────────────────────────────────────────
+    if resolution == "conflict_cancel":
+        detail = ", ".join(f"{s.strategy_name}={s.direction}" for s in active)
+        logger.info(f"[DIRECTION] conflict_cancel: {detail}")
+    elif active:
+        w = max(active, key=lambda s: s.score)
+        logger.info(
+            f"[DIRECTION] {resolution}: {len(active)} estrategia(s) → {direction} "
+            f"(score={winner_score:.3f}, ganadora={w.strategy_name})"
+        )
+
+    return direction, winner_score, signals, resolution
 
 
 # ─── Singleton ────────────────────────────────────────────────────────────────
