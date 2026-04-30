@@ -45,10 +45,35 @@ def _parse_mode() -> str:
 _BOT_MODE = _parse_mode()
 
 from asset_scanner import asset_scanner
-from iqservice import iq_service
+from iqservice import iq_service, REMEDIATION_MODE
 from retrain_scheduler import retrain_scheduler
 
-if _BOT_MODE == "paper":
+# ─── Deprecated: trader/paper_trader bloqueados durante remediación ──────────
+# En modo remediación, el motor oficial es asset_scanner.
+# trading_bot se reemplaza por un stub inerte para no romper endpoints legacy.
+
+class _DeprecatedBotStub:
+    """Stub inerte que reemplaza trading_bot durante remediación."""
+    running = False
+    on_notification = None
+    signal_history = []
+
+    def start(self, *a, **kw):
+        raise RuntimeError("REMEDIATION MODE — trader/paper_trader deprecated. Use asset_scanner.")
+
+    def stop(self):
+        pass
+
+    def get_status(self):
+        return {"running": False, "deprecated": True, "message": "Use asset_scanner instead"}
+
+if REMEDIATION_MODE:
+    trading_bot = _DeprecatedBotStub()
+    logging.getLogger(__name__).warning(
+        "═══ REMEDIATION MODE — trader/paper_trader DEPRECATED ═══ "
+        "(use asset_scanner)"
+    )
+elif _BOT_MODE == "paper":
     from paper_trader import paper_trading_bot as trading_bot
     logging.getLogger(__name__).info("═══ MODO PAPER TRADING ═══ (sin órdenes reales)")
 else:
@@ -66,7 +91,28 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    await retrain_scheduler.start()
+    from iqservice import REMEDIATION_MODE, FORCE_DEMO_ACCOUNT, ML_DISABLED_MODE
+    if REMEDIATION_MODE:
+        logger.warning(
+            "═══ REMEDIATION MODE — DEMO ONLY ═══ "
+            f"(FORCE_DEMO_ACCOUNT={FORCE_DEMO_ACCOUNT}, "
+            f"ML_DISABLED={ML_DISABLED_MODE})"
+        )
+        if ML_DISABLED_MODE:
+            from iqservice import (
+                ML_DISABLED_MIN_SCORE, ML_DISABLED_MAX_ASSET_LOSSES,
+                ML_DISABLED_MAX_DAILY_LOSSES, ML_DISABLED_MAX_DAILY_TRADES,
+            )
+            logger.warning(
+                "OPERATING WITHOUT ML — REDUCED RISK MODE | "
+                f"min_score={ML_DISABLED_MIN_SCORE} | "
+                f"max_asset_losses={ML_DISABLED_MAX_ASSET_LOSSES} | "
+                f"max_daily_losses={ML_DISABLED_MAX_DAILY_LOSSES} | "
+                f"max_daily_trades={ML_DISABLED_MAX_DAILY_TRADES}"
+            )
+        logger.warning("REMEDIATION MODE — retrain_scheduler disabled")
+    else:
+        await retrain_scheduler.start()
     yield
     # Shutdown
     logger.info("Deteniendo el servidor y garantizando la desocupación del puerto...")

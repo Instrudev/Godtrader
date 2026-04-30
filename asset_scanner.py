@@ -20,12 +20,17 @@ Flujo por ciclo:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import random
+import sqlite3
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -37,14 +42,52 @@ from indicators import (
     build_dataframe,
     compute_prng_features,
     detect_bb_body_reversal,
+    detect_bb_body_reversal_call,
     detect_bb_two_candle_reversal,
     get_streak_info,
     pre_qualify,
 )
-from iqservice import iq_service
+from iqservice import (
+    iq_service,
+    ML_DISABLED_MODE,
+    ML_DISABLED_MIN_SCORE,
+    ML_DISABLED_MAX_ASSET_LOSSES,
+    ML_DISABLED_MAX_DAILY_LOSSES,
+    ML_DISABLED_MAX_DAILY_TRADES,
+)
 from ml_classifier import ml_classifier, extract_features
+from regime_filter import (
+    check_all_filters,
+    MAX_ASSET_DAILY_LOSSES,
+    MAX_DAILY_LOSSES,
+    MAX_TRADES_PER_DAY,
+)
 
 logger = logging.getLogger(__name__)
+
+# ─── Logger JSONL para decisiones de estrategia ──────────────────────────────
+
+_decision_logger = logging.getLogger("strategy_decisions")
+_decision_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_decision_log_dir, exist_ok=True)
+_decision_handler = logging.FileHandler(
+    os.path.join(_decision_log_dir, "strategy_decisions.log"), encoding="utf-8"
+)
+_decision_handler.setFormatter(logging.Formatter("%(message)s"))
+_decision_logger.addHandler(_decision_handler)
+_decision_logger.setLevel(logging.INFO)
+
+
+# ─── Señal de estrategia ─────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class StrategySignal:
+    """Resultado de evaluación de una estrategia individual."""
+    active: bool
+    direction: Optional[str]   # "CALL" | "PUT" | None
+    score: float
+    strategy_name: str
+
 
 # ─── Constantes ───────────────────────────────────────────────────────────────
 
@@ -91,6 +134,7 @@ class AssetScanner:
         # Stats
         self.total_scans: int = 0
         self.signals_found: int = 0
+        self._strategy_telemetry: Dict[str, int] = self._fresh_telemetry()
         self.trades_executed: int = 0
         self.trade_log: List[Dict] = []
         self.last_scan_result: List[Dict] = []
@@ -126,7 +170,6 @@ class AssetScanner:
         self.total_scans     = 0
         self.signals_found   = 0
         self.trades_executed = 0
-        self.trade_log       = []
         self.last_scan_result = []
         self.last_scan_time  = None
 
@@ -134,6 +177,7 @@ class AssetScanner:
             ml_classifier.load()
 
         init_db(DB_PATH)
+        self.trade_log = self._reconstruct_trade_log()
         self._task = asyncio.create_task(self._scan_loop())
 
         logger.info("=" * 60)
@@ -159,6 +203,65 @@ class AssetScanner:
             f"Señales={self.signals_found} | Trades={self.trades_executed}"
         )
 
+    def _reconstruct_trade_log(self) -> List[Dict]:
+        """
+        Reconstruye trade_log desde la BD con trades del día UTC actual.
+
+        Mitiga la vulnerabilidad post-restart: si el bot se reinicia tras
+        acumular pérdidas, los contadores de daily_loss y per_asset_loss
+        se reconstruyen correctamente desde la fuente de verdad (BD).
+        """
+        try:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT timestamp, asset, direction, result
+                    FROM trades
+                    WHERE timestamp >= ? AND timestamp < ?
+                      AND result IN ('WIN', 'LOSS', 'TIE')
+                    ORDER BY timestamp ASC
+                    """,
+                    (today, tomorrow),
+                ).fetchall()
+
+            records = [
+                {
+                    "timestamp": row["timestamp"],
+                    "asset":     row["asset"],
+                    "direction": row["direction"],
+                    "result":    row["result"],
+                }
+                for row in rows
+            ]
+            logger.info(
+                f"[SCANNER] Reconstruyendo trade_log desde BD: "
+                f"{len(records)} trades del día UTC actual ({today}) cargados."
+            )
+            return records
+
+        except Exception as e:
+            logger.error(
+                f"[SCANNER] Could not reconstruct trade_log: {e}. "
+                "Daily limits may be incorrect."
+            )
+            # Log de seguridad para auditoría
+            try:
+                from iqservice import _security_logger
+                ts = datetime.now(timezone.utc).isoformat()
+                _security_logger.warning(
+                    f"[{ts}] HALT_TYPE=TRADE_LOG_RECONSTRUCTION_FAILED "
+                    f"exception={type(e).__name__}: {e} "
+                    f"impact=Daily limits may be incorrect until next successful startup "
+                    f"action_required=Manual verification of daily loss counters"
+                )
+            except Exception:
+                pass
+            return []
+
     def get_status(self) -> Dict:
         wins  = sum(1 for t in self.trade_log if t.get("result") == "WIN")
         total = len(self.trade_log)
@@ -181,6 +284,30 @@ class AssetScanner:
             },
             "trade_log": self.trade_log[-20:],
         }
+
+    # ─── Telemetría de estrategias ───────────────────────────────────────────
+
+    @staticmethod
+    def _fresh_telemetry() -> Dict[str, int]:
+        from regime_filter import _today_utc
+        return {
+            "single_match": 0, "multiple_match": 0,
+            "conflict_cancel": 0, "no_signal": 0,
+            "session_date_utc": _today_utc(),
+        }
+
+    def _check_telemetry_reset(self) -> None:
+        """Resetea contadores si el día UTC cambió."""
+        from regime_filter import _today_utc
+        today = _today_utc()
+        if self._strategy_telemetry.get("session_date_utc") != today:
+            logger.info(f"[TELEMETRY] Nuevo día UTC ({today}). Reseteando contadores.")
+            self._strategy_telemetry = self._fresh_telemetry()
+
+    def get_strategy_telemetry(self) -> Dict:
+        """Snapshot de telemetría de estrategias del día actual."""
+        self._check_telemetry_reset()
+        return dict(self._strategy_telemetry)
 
     # ─── Bucle principal ──────────────────────────────────────────────────────
 
@@ -286,6 +413,8 @@ class AssetScanner:
 
                 # Ejecutar el mejor candidato (fallback a 2do, 3ro...)
                 for candidate in qualified:
+                    if not self.running:
+                        break
                     executed = await asyncio.to_thread(self._try_execute, candidate)
                     if executed:
                         self.trades_executed += 1
@@ -338,13 +467,13 @@ class AssetScanner:
                     base["reason"] = reason
                     return base
 
-                direction = _infer_direction(df)
-                score = _score_signal(df)
+                direction, score, _sigs, resolution = _evaluate_strategies(df, asset=asset)
 
                 return {
                     "asset": asset, "qualifies": True,
                     "reason": reason, "score": score,
                     "df": df, "direction": direction,
+                    "resolution": resolution,
                 }
             except Exception as e:
                 logger.warning(f"  {asset}: error en confirmación → {e}")
@@ -488,8 +617,7 @@ class AssetScanner:
                 base["reason"] = reason
                 return base
 
-            direction = _infer_direction(df)
-            score     = _score_signal(df)
+            direction, score, _sigs, resolution = _evaluate_strategies(df, asset=asset)
 
             logger.info(
                 f"  {asset}: ✓ dir={direction} score={score:.3f} | {reason[:55]}"
@@ -501,6 +629,7 @@ class AssetScanner:
                 "score":     score,
                 "df":        df,
                 "direction": direction,
+                "resolution": resolution,
             }
 
         except Exception as e:
@@ -512,28 +641,32 @@ class AssetScanner:
 
     def _try_execute(self, candidate: Dict) -> bool:
         """
-        Valida con ML y ejecuta si supera el umbral.
+        Aplica filtros de régimen, valida con ML y ejecuta si supera el umbral.
         Devuelve True si se ejecutó el trade.
+
+        Flujo:
+          1. Direction check
+          2. Contexto de mercado (payout, hora, weekday)
+          3. check_all_filters (13 filtros de régimen)
+          4. ML validation
+          5. Guardia de tiempo
+          6. Ejecución
         """
         asset     = candidate["asset"]
         df        = candidate["df"]
         direction = candidate["direction"]
 
+        # ── Telemetría de estrategias (solo en flujo de decisión final) ───────
+        self._check_telemetry_reset()
+        resolution = candidate.get("resolution", "no_signal")
+        if resolution in self._strategy_telemetry:
+            self._strategy_telemetry[resolution] += 1
+
         if direction is None:
-            logger.info(f"[SCANNER] {asset}: dirección indeterminada. Skip.")
+            logger.info(f"[SCANNER] {asset}: dirección indeterminada ({resolution}). Skip.")
             return False
 
-        # ── Filtro anti-repetición de pérdidas ───────────────────────────────
-        try:
-            from regime_filter import loss_pattern_filter
-            lp_result = loss_pattern_filter(df, asset, direction)
-            if not lp_result.allow:
-                logger.info(f"[SCANNER] {asset}: ✗ {lp_result.reason}")
-                return False
-        except Exception as e:
-            logger.debug(f"[SCANNER] loss_pattern_filter error: {e}")
-
-        # ── Contexto de mercado (siempre necesario para persistir) ────────────
+        # ── Contexto de mercado (requerido por filtros Y por persistencia) ────
         try:
             last      = df.iloc[-1]
             ts_time   = last["time"]
@@ -547,47 +680,96 @@ class AssetScanner:
             logger.warning(f"[SCANNER] {asset}: error contexto → {e}")
             return False
 
-        # ── Validación ML (solo si hay datos suficientes) ─────────────────────
-        proba  = 0.5   # valor por defecto cuando el ML no está listo
+        # ── Defaults para variables usadas más adelante en logging/persistencia ─
+        proba  = 0.5
         pr_pct = 50
 
-        try:
-            from database import fetch_trades
-            closed_count = len([
-                t for t in fetch_trades(limit=9999, path=DB_PATH)
-                if t.get("result") in ("WIN", "LOSS")
-            ])
-        except Exception:
-            closed_count = 0
+        # ── Determinar límites según modo ML ─────────────────────────────────
+        if ML_DISABLED_MODE:
+            asset_loss_limit = ML_DISABLED_MAX_ASSET_LOSSES
+            daily_loss_limit = ML_DISABLED_MAX_DAILY_LOSSES
+            trades_limit     = ML_DISABLED_MAX_DAILY_TRADES
+        else:
+            asset_loss_limit = MAX_ASSET_DAILY_LOSSES
+            daily_loss_limit = MAX_DAILY_LOSSES
+            trades_limit     = MAX_TRADES_PER_DAY
 
-        ml_active = ml_classifier.is_loaded() and closed_count >= ML_MIN_TRADES
+        # ── Filtros de régimen OTC (14 filtros via check_all_filters) ─────────
+        regime = check_all_filters(
+            df=df,
+            asset=asset,
+            trade_log=self.trade_log,
+            payout=payout,
+            direction=direction,
+            max_asset_losses=asset_loss_limit,
+            max_daily_losses=daily_loss_limit,
+            max_trades=trades_limit,
+        )
+        if not regime.allow:
+            logger.info(f"[SCANNER] {asset}: ✗ {regime.filter_name}: {regime.reason}")
+            if regime.auto_shutdown:
+                logger.warning(f"[SCANNER][AUTOSHUTDOWN] {regime.reason}")
+                self._notify("BOT_AUTOSHUTDOWN", regime.reason, data={"filter": regime.filter_name})
+                self.running = False
+            return False
 
-        if ml_active:
-            try:
-                features  = extract_features(
-                    df, payout=payout, winrate_hour=winrate_hour, direction=direction, expiry_min=self.expiry_min
-                )
-                if features is None:
-                    logger.info(f"[SCANNER] {asset}: features None. Skip.")
-                    return False
-                probas    = ml_classifier.predict_proba(features)
-                proba_key = "call_proba" if direction == "CALL" else "put_proba"
-                proba     = probas.get(proba_key, 0.5)
-                pr_pct    = int(round(proba * 100))
-            except Exception as e:
-                logger.warning(f"[SCANNER] {asset}: error ML → {e}")
-
+        # ── Validación ML o Score de estrategia ───────────────────────────────
+        if ML_DISABLED_MODE:
+            # Sin ML: validar por score de estrategia
+            score = candidate.get("score", 0.0)
             logger.info(
-                f"[SCANNER] {asset} | {direction} | ML proba={pr_pct}% | umbral={MIN_PROBABILITY}%"
+                f"[SCANNER] {asset} | {direction} | ML_DISABLED | "
+                f"score={score:.3f} | umbral={ML_DISABLED_MIN_SCORE}"
             )
-            if pr_pct < MIN_PROBABILITY:
-                logger.info(f"[SCANNER] {asset}: rechazado por ML ({pr_pct}% < {MIN_PROBABILITY}%)")
+            if score < ML_DISABLED_MIN_SCORE:
+                logger.info(
+                    f"[SCANNER] {asset}: score {score:.3f} < {ML_DISABLED_MIN_SCORE}. "
+                    "Rechazado (ML_DISABLED_MODE)."
+                )
                 return False
         else:
-            logger.info(
-                f"[SCANNER] {asset} | {direction} | "
-                f"ML en modo recolección ({closed_count}/{ML_MIN_TRADES} trades) — ejecutando por estrategia pura"
-            )
+            # Con ML: validación estándar
+            proba  = 0.5
+            pr_pct = 50
+
+            try:
+                from database import fetch_trades
+                closed_count = len([
+                    t for t in fetch_trades(limit=9999, path=DB_PATH)
+                    if t.get("result") in ("WIN", "LOSS")
+                ])
+            except Exception:
+                closed_count = 0
+
+            ml_active = ml_classifier.is_loaded() and closed_count >= ML_MIN_TRADES
+
+            if ml_active:
+                try:
+                    features = extract_features(
+                        df, payout=payout, winrate_hour=winrate_hour,
+                        direction=direction, expiry_min=self.expiry_min,
+                    )
+                    if features is None:
+                        logger.info(f"[SCANNER] {asset}: features None. Skip.")
+                        return False
+                    probas    = ml_classifier.predict_proba(features)
+                    proba_key = "call_proba" if direction == "CALL" else "put_proba"
+                    proba     = probas.get(proba_key, 0.5)
+                    pr_pct    = int(round(proba * 100))
+                except Exception as e:
+                    logger.warning(f"[SCANNER] {asset}: error ML → {e}")
+
+                logger.info(
+                    f"[SCANNER] {asset} | {direction} | ML proba={pr_pct}% | umbral={MIN_PROBABILITY}%"
+                )
+                if pr_pct < MIN_PROBABILITY:
+                    logger.info(f"[SCANNER] {asset}: rechazado por ML ({pr_pct}% < {MIN_PROBABILITY}%)")
+                    return False
+            else:
+                logger.info(
+                    f"[SCANNER] {asset}: ML requerido pero no cargado. No se opera."
+                )
+                return False
 
         # ── Guardia de tiempo: no entrar si ya pasaron muchos segundos de la vela ─
         secs_into_candle = time.time() % CANDLE_INTERVAL
@@ -924,55 +1106,25 @@ class AssetScanner:
             asyncio.run_coroutine_threadsafe(coro, self.loop)
 
 
-# ─── Helpers de señal ─────────────────────────────────────────────────────────
+# ─── Evaluación consolidada de estrategias ───────────────────────────────────
 
-def _infer_direction(df: pd.DataFrame) -> Optional[str]:
+def _evaluate_strategies(
+    df: pd.DataFrame,
+    asset: str = "",
+) -> Tuple[Optional[str], float, List[StrategySignal], str]:
     """
-    Infiere la dirección esperada (PUT/CALL) desde los indicadores.
+    Evalúa las 4 estrategias en paralelo y aplica arbitraje de conflictos.
 
-    Prioridad:
-      1. bb_2candle_reversal → CALL o PUT (2 velas fuera de BB)
-      2. bb_body_reversal    → siempre PUT
-      3. Racha extrema       → reversión (bear→CALL, bull→PUT)
-      4. RSI clásico         → <35 CALL, >65 PUT
-    """
-    last = df.iloc[-1]
-    rsi  = float(last["rsi"])
+    Reemplaza _infer_direction (cascada) + _score_signal (duplicación).
+    Cada estrategia se evalúa independientemente. Si hay conflicto de
+    dirección, se cancela la operación.
 
-    # 1. bb_2candle_reversal → CALL o PUT
-    bb2_ok, bb2_dir, _ = detect_bb_two_candle_reversal(df)
-    if bb2_ok and bb2_dir:
-        return bb2_dir
-
-    # 2. bb_body_reversal → siempre PUT
-    ok, _ = detect_bb_body_reversal(df)
-    if ok:
-        return "PUT"
-
-    # 3. Racha extrema → reversión
-    streak = get_streak_info(df)
-    if streak["is_extreme"]:
-        return "CALL" if streak["direction"] == "bear" else "PUT"
-
-    # 3. RSI clásico
-    if rsi < 35:
-        return "CALL"
-    if rsi > 65:
-        return "PUT"
-
-    return None
-
-
-def _score_signal(df: pd.DataFrame) -> float:
-    """
-    Puntúa la fuerza de la señal en [0.0, 1.0]. Mayor = mejor candidato.
-
-    Permite comparar señales de distintos activos y elegir el más fuerte.
-
-    Componentes:
-      - bb_body_reversal: extensión sobre umbral + RSI + volumen
-      - Racha extrema:    percentil + longitud de racha
-      - RSI clásico:      distancia del RSI al neutro + posición en BB
+    Returns:
+        (direction, score, signals, resolution)
+        - direction: "CALL"/"PUT" o None si conflicto/nada activo
+        - score: score del ganador (0.0 si None)
+        - signals: lista completa de StrategySignal para auditoría
+        - resolution: "single_match" | "multiple_match" | "conflict_cancel" | "no_signal"
     """
     last    = df.iloc[-1]
     rsi     = float(last["rsi"])
@@ -983,44 +1135,122 @@ def _score_signal(df: pd.DataFrame) -> float:
     bb_low  = float(last["bb_lower"])
     bb_rng  = bb_up - bb_low
     vol_rel = float(last.get("vol_rel", 1.0))
-    score   = 0.0
 
-    # ── bb_2candle_reversal (máxima prioridad) ──────────────────────────────
+    signals: List[StrategySignal] = []
+
+    # ── 1. BB 2-Candle Reversal ──────────────────────────────────────────────
     bb2_ok, bb2_dir, _ = detect_bb_two_candle_reversal(df)
-    if bb2_ok:
-        # Score alto: base 0.70 + bonus por RSI extremo
-        rsi_extremity = (35 - rsi) / 35 if rsi < 35 else (rsi - 65) / 35 if rsi > 65 else 0.0
-        score = max(score, 0.70 + min(rsi_extremity, 1.0) * 0.25)
+    if bb2_ok and bb2_dir:
+        rsi_extremity = (25 - rsi) / 25 if rsi < 25 else (rsi - 75) / 25 if rsi > 75 else 0.0
+        s = round(min(0.70 + min(rsi_extremity, 1.0) * 0.25, 1.0), 4)
+        signals.append(StrategySignal(True, bb2_dir, s, "bb_2candle"))
+    else:
+        signals.append(StrategySignal(False, None, 0.0, "bb_2candle"))
 
-    # ── bb_body_reversal ──────────────────────────────────────────────────────
-    body = price - open_
-    if body > 0:
-        threshold = open_ + body * 0.10
-        if bb_mid <= threshold:
-            ext   = min((threshold - bb_mid) / body, 1.0)
-            rsi_f = max(0.0, (rsi - 55) / 45)
-            vol_f = min(max(vol_rel - 1.0, 0.0), 1.0) * 0.10
-            score = max(score, 0.50 + ext * 0.28 + rsi_f * 0.15 + vol_f)
+    # ── 2. BB Body Reversal — DEPRECADA (Tarea 2.3) ────────────────────────
+    # No participa en decisión. Se registra como phantom en el log JSONL.
+    # Rendimiento histórico: 25% WR (1W/3L en 4 trades).
+    # Solo PUT, asimetría no validable. Deprecación instrumentada.
+    signals.append(StrategySignal(False, None, 0.0, "bb_body"))
 
-    # ── Racha extrema ─────────────────────────────────────────────────────────
+    # ── 3. Streak Reversal ───────────────────────────────────────────────────
     streak = get_streak_info(df)
     if streak["is_extreme"]:
         pct_f = streak["percentile"] / 100
         len_f = min(streak["current_length"], 8) / 8
-        score = max(score, pct_f * 0.75 + len_f * 0.25)
+        s = round(min(pct_f * 0.75 + len_f * 0.25, 1.0), 4)
+        streak_dir = "CALL" if streak["direction"] == "bear" else "PUT"
+        signals.append(StrategySignal(True, streak_dir, s, "streak"))
+    else:
+        signals.append(StrategySignal(False, None, 0.0, "streak"))
 
-    # ── RSI clásico + BB ──────────────────────────────────────────────────────
+    # ── 4. RSI Clásico + BB (umbrales endurecidos: 25/75, zone 10%) ─────────
     pct_b = (price - bb_low) / bb_rng if bb_rng > 1e-10 else 0.5
-    if rsi < 35:
-        rsi_f = (35 - rsi) / 35
-        bb_f  = max(0.0, 0.20 - pct_b) / 0.20
-        score = max(score, 0.40 + rsi_f * 0.30 + bb_f * 0.30)
-    elif rsi > 65:
-        rsi_f = (rsi - 65) / 35
-        bb_f  = max(0.0, pct_b - 0.80) / 0.20
-        score = max(score, 0.40 + rsi_f * 0.30 + bb_f * 0.30)
+    if rsi < 25:
+        rsi_f = (25 - rsi) / 25
+        bb_f  = max(0.0, 0.10 - pct_b) / 0.10
+        s = round(min(0.40 + rsi_f * 0.30 + bb_f * 0.30, 1.0), 4)
+        signals.append(StrategySignal(True, "CALL", s, "rsi_classical"))
+    elif rsi > 75:
+        rsi_f = (rsi - 75) / 25
+        bb_f  = max(0.0, pct_b - 0.90) / 0.10
+        s = round(min(0.40 + rsi_f * 0.30 + bb_f * 0.30, 1.0), 4)
+        signals.append(StrategySignal(True, "PUT", s, "rsi_classical"))
+    else:
+        signals.append(StrategySignal(False, None, 0.0, "rsi_classical"))
 
-    return round(min(score, 1.0), 4)
+    # ── Arbitraje ────────────────────────────────────────────────────────────
+    active = [s for s in signals if s.active]
+
+    if not active:
+        resolution = "no_signal"
+        direction, winner_score = None, 0.0
+    else:
+        directions = {s.direction for s in active}
+        if len(directions) == 1:
+            winner = max(active, key=lambda s: s.score)
+            resolution = "single_match" if len(active) == 1 else "multiple_match"
+            direction, winner_score = winner.direction, winner.score
+        else:
+            resolution = "conflict_cancel"
+            direction, winner_score = None, 0.0
+
+    # ── Instrumentación phantom BB Body (deprecada pero observada) ──────────
+    phantom_signal = None
+    try:
+        put_ok, _ = detect_bb_body_reversal(df)
+        call_ok, _ = detect_bb_body_reversal_call(df)
+        if put_ok and call_ok:
+            phantom_signal = "BOTH_phantom"
+        elif put_ok:
+            phantom_signal = "PUT_phantom"
+        elif call_ok:
+            phantom_signal = "CALL_phantom"
+    except Exception:
+        pass
+
+    # ── Log JSONL ────────────────────────────────────────────────────────────
+    try:
+        winner_data = None
+        if direction is not None:
+            w = max(active, key=lambda s: s.score)
+            winner_data = {"strategy": w.strategy_name, "direction": w.direction, "score": w.score}
+
+        entry = {
+            "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "asset": asset,
+            "resolution": resolution,
+            "active_count": len(active),
+            "winner": winner_data,
+            "all_signals": [
+                {"strategy": s.strategy_name, "active": s.active,
+                 "direction": s.direction, "score": s.score}
+                for s in signals
+            ],
+            "conflict_detail": (
+                ", ".join(f"{s.strategy_name}={s.direction}" for s in active)
+                if resolution == "conflict_cancel" else None
+            ),
+            "phantom_signals": {
+                "bb_body": phantom_signal,
+            },
+        }
+        _decision_logger.info(json.dumps(entry, separators=(",", ":")))
+    except Exception:
+        pass
+
+    # ── Log principal ────────────────────────────────────────────────────────
+    if resolution == "conflict_cancel":
+        detail = ", ".join(f"{s.strategy_name}={s.direction}" for s in active)
+        logger.info(f"[DIRECTION] conflict_cancel: {detail}")
+    elif active:
+        w = max(active, key=lambda s: s.score)
+        logger.info(
+            f"[DIRECTION] {resolution}: {len(active)} estrategia(s) → {direction} "
+            f"(score={winner_score:.3f}, ganadora={w.strategy_name})"
+        )
+
+    return direction, winner_score, signals, resolution
 
 
 # ─── Singleton ────────────────────────────────────────────────────────────────

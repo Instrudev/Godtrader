@@ -1,15 +1,32 @@
 """
 ai_brain.py – Motor de Decisión IA con Ollama (LLM Local)
-Optimizado para Apple Silicon M5 via Metal GPU (inferencia en memoria unificada).
 
-Arquitectura del snapshot (3 bloques minificados para mínimo uso de tokens):
-  [MACRO]  → Tendencia EMA200, soportes/resistencias de 300 velas, volatilidad
-  [TECH]   → RSI, posición en Bollinger, Volumen Relativo
-  [MICRO]  → OHLC de últimas 10 velas + patrones detectados
+DEPRECATED: This module is deprecated as of remediation/v1.
 
-El LLM actúa como analista institucional buscando trampas de liquidez
-y señales de reversión (Pin Bars, Envolventes).
+ai_brain.py is only invoked by trader.py (now deprecated) as an LLM
+fallback when the ML classifier is unavailable. Using an LLM as a
+trading decision gate is architecturally questionable and not
+validated under the current remediation plan.
+
+See CHANGELOG_REMEDIATION.md for details.
 """
+
+import warnings
+from iqservice import ALLOW_DEPRECATED_TRADERS
+
+if not ALLOW_DEPRECATED_TRADERS:
+    raise ImportError(
+        f"{__name__} is deprecated and disabled during remediation. "
+        "Use asset_scanner.py instead. "
+        "If you have a valid reason to use this module, set "
+        "ALLOW_DEPRECATED_TRADERS=True in iqservice.py with documented justification."
+    )
+
+warnings.warn(
+    f"{__name__} is deprecated. Use asset_scanner.py instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 import json
 import logging

@@ -351,12 +351,19 @@ def pre_qualify(df: pd.DataFrame, asset: str = "", config: Optional[Dict] = None
 
     # ── 2. Señal primaria OTC: racha extrema → reversión esperada ─────────────
     streak = get_streak_info(df)
-    pct_min = cfg.get("streak_percentile_min", 70)
+    pct_min = cfg.get("streak_percentile_min", 90)
 
-    if streak["percentile"] >= pct_min and streak["current_length"] >= 2:
+    if streak["percentile"] >= pct_min and streak["current_length"] >= 4:
         direction = "CALL" if streak["direction"] == "bear" else "PUT"
+        # Half-life obligatorio: mean-reversion debe ser demostrable
         hl = estimate_half_life(df)
-        hl_str = f" | Half-life≈{hl:.1f}v" if hl < float("inf") else ""
+        if hl > 25:
+            return False, (
+                f"Racha {streak['direction'].upper()} {streak['current_length']}v "
+                f"(pct={streak['percentile']:.0f}%) pero half-life {hl:.1f}v > 25 "
+                "(mean-reversion insuficiente)"
+            )
+        hl_str = f" | Half-life≈{hl:.1f}v"
         reason = (
             f"Racha {streak['direction'].upper()} {streak['current_length']}v "
             f"(pct={streak['percentile']:.0f}%) → reversión {direction}"
@@ -403,19 +410,19 @@ def pre_qualify_classical(df: pd.DataFrame) -> Tuple[bool, str]:
     bb_lower = float(last["bb_lower"])
     vol_rel  = float(last.get("vol_rel", 1.0))
 
-    rsi_extreme = rsi < 35 or rsi > 65
+    rsi_extreme = rsi < 25 or rsi > 75
     bb_range    = bb_upper - bb_lower
     pct_b       = (price - bb_lower) / bb_range if bb_range > 1e-10 else 0.5
-    bb_touch    = pct_b <= 0.15 or pct_b >= 0.85
+    bb_touch    = pct_b <= 0.10 or pct_b >= 0.90
 
     if rsi_extreme and bb_touch:
-        rsi_label = "SOBREVENDIDO" if rsi < 35 else "SOBRECOMPRADO"
-        bb_label  = "ZONA_INF" if pct_b <= 0.15 else "ZONA_SUP"
+        rsi_label = "SOBREVENDIDO" if rsi < 25 else "SOBRECOMPRADO"
+        bb_label  = "ZONA_INF" if pct_b <= 0.10 else "ZONA_SUP"
         return True, f"[clásico] RSI {rsi:.1f} ({rsi_label}) + {bb_label} | VolRel={vol_rel:.2f}x"
 
     reasons = []
     if not rsi_extreme:
-        reasons.append(f"RSI {rsi:.1f} [neutral 35-65]")
+        reasons.append(f"RSI {rsi:.1f} [neutral 25-75]")
     if not bb_touch:
         reasons.append(f"precio central (pct_b={pct_b:.2f})")
     return False, " / ".join(reasons)
@@ -475,32 +482,52 @@ def detect_bb_two_candle_reversal(df: pd.DataFrame) -> Tuple[bool, Optional[str]
     c2_open = float(c2["open"])
     c2_close = float(c2["close"])
 
-    # ── Check CALL: 2 velas > 50% body debajo de BB lower + RSI oversold + vela alcista
+    # ── Check CALL: 2 velas > 70% body debajo de BB lower + RSI oversold + divergencia + vela alcista
     pct_below_1 = _body_below_bb_lower_pct(c1)
     pct_below_2 = _body_below_bb_lower_pct(c2)
 
-    if pct_below_1 > 0.50 and pct_below_2 > 0.50:
+    if pct_below_1 > 0.70 and pct_below_2 > 0.70:
         if rsi < 20:
+            # Divergencia RSI alcista: precio hace lower low pero RSI sube
+            if len(df) >= 4:
+                low_N  = float(c2["low"])
+                low_N3 = float(df.iloc[-4]["low"])
+                rsi_N3 = float(df.iloc[-4]["rsi"])
+                if not (low_N < low_N3 and rsi > rsi_N3):
+                    return False, None, (
+                        f"Sin divergencia RSI alcista (low={low_N:.5f} vs low_N3={low_N3:.5f}, "
+                        f"rsi={rsi:.1f} vs rsi_N3={rsi_N3:.1f})"
+                    )
             if c2_close > c2_open:  # vela alcista = confirmación de rebote
                 return True, "CALL", (
                     f"[bb_2candle] CALL: 2 velas con >{pct_below_1:.0%}/{pct_below_2:.0%} "
                     f"body bajo BB-Lower | RSI={rsi:.1f} (sobreventa) | "
-                    f"última vela alcista (confirmación)"
+                    f"divergencia RSI confirmada | última vela alcista"
                 )
             return False, None, f"RSI {rsi:.1f} OK pero última vela no es alcista (sin confirmación)"
         return False, None, f"2 velas bajo BB-Lower pero RSI {rsi:.1f} no confirma sobreventa (<20)"
 
-    # ── Check PUT: 2 velas > 50% body encima de BB upper + RSI overbought + vela bajista
+    # ── Check PUT: 2 velas > 70% body encima de BB upper + RSI overbought + divergencia + vela bajista
     pct_above_1 = _body_above_bb_upper_pct(c1)
     pct_above_2 = _body_above_bb_upper_pct(c2)
 
-    if pct_above_1 > 0.50 and pct_above_2 > 0.50:
+    if pct_above_1 > 0.70 and pct_above_2 > 0.70:
         if rsi > 80:
+            # Divergencia RSI bajista: precio hace higher high pero RSI baja
+            if len(df) >= 4:
+                high_N  = float(c2["high"])
+                high_N3 = float(df.iloc[-4]["high"])
+                rsi_N3  = float(df.iloc[-4]["rsi"])
+                if not (high_N > high_N3 and rsi < rsi_N3):
+                    return False, None, (
+                        f"Sin divergencia RSI bajista (high={high_N:.5f} vs high_N3={high_N3:.5f}, "
+                        f"rsi={rsi:.1f} vs rsi_N3={rsi_N3:.1f})"
+                    )
             if c2_close < c2_open:  # vela bajista = confirmación de caída
                 return True, "PUT", (
                     f"[bb_2candle] PUT: 2 velas con >{pct_above_1:.0%}/{pct_above_2:.0%} "
                     f"body sobre BB-Upper | RSI={rsi:.1f} (sobrecompra) | "
-                    f"última vela bajista (confirmación)"
+                    f"divergencia RSI confirmada | última vela bajista"
                 )
             return False, None, f"RSI {rsi:.1f} OK pero última vela no es bajista (sin confirmación)"
         return False, None, f"2 velas sobre BB-Upper pero RSI {rsi:.1f} no confirma sobrecompra (>80)"
@@ -553,6 +580,59 @@ def detect_bb_body_reversal(df: pd.DataFrame) -> Tuple[bool, str]:
     ext_pct = (threshold - bb_mid) / body * 100
     return True, (
         f"[bb_body_reversal] Vela verde extendida sobre BB-Mid "
+        f"(ext={ext_pct:.0f}% sobre umbral) | RSI={rsi:.1f} | "
+        f"BB-W={bb_width:.3f}% | VolRel={vol_rel:.2f}x"
+    )
+
+
+def detect_bb_body_reversal_call(df: pd.DataFrame) -> Tuple[bool, str]:
+    """
+    EXPERIMENTAL — Espejo CALL de detect_bb_body_reversal (Tarea 2.3).
+
+    Detecta vela ROJA gigante donde BB_mid queda en el 10% SUPERIOR del cuerpo.
+    Indica que el precio cayó de forma insostenible → presión alcista.
+
+    Condiciones (espejo simétrico de la versión PUT):
+        close < open  (vela roja)
+        bb_mid ≥ close + (open - close) * 0.90  (BB_mid en 10% superior)
+        RSI < 45      (confirma sobreextensión bajista)
+        bb_width > 0.3%
+        vol_rel ≥ 1.0
+
+    NO integrada en producción. Solo para instrumentación phantom (Tarea 2.3).
+    """
+    if len(df) < 20:
+        return False, "DataFrame insuficiente"
+
+    last     = df.iloc[-1]
+    open_    = float(last["open"])
+    close    = float(last["close"])
+    bb_mid   = float(last["bb_mid"])
+    bb_width = float(last["bb_width"])
+    rsi      = float(last["rsi"])
+    vol_rel  = float(last.get("vol_rel", 1.0))
+
+    body = open_ - close  # vela ROJA: open > close
+    if body <= 0:
+        return False, "Vela no es bajista"
+
+    # BB_mid en el 10% superior del cuerpo (espejo: close + 90% del body)
+    threshold = close + body * 0.90
+    if bb_mid < threshold:
+        return False, f"bb_mid al {(bb_mid - close) / body * 100:.0f}% del cuerpo (necesita ≥90%)"
+
+    if rsi >= 45:
+        return False, f"RSI {rsi:.1f} ≥ 45 (sin sobreextensión bajista)"
+
+    if bb_width <= 0.30:
+        return False, f"BB-Width {bb_width:.3f}% ≤ 0.30% (squeeze)"
+
+    if vol_rel < 1.0:
+        return False, f"VolRel {vol_rel:.2f}x < 1.0 (volumen insuficiente)"
+
+    ext_pct = (bb_mid - threshold) / body * 100
+    return True, (
+        f"[bb_body_call] Vela roja extendida bajo BB-Mid "
         f"(ext={ext_pct:.0f}% sobre umbral) | RSI={rsi:.1f} | "
         f"BB-W={bb_width:.3f}% | VolRel={vol_rel:.2f}x"
     )

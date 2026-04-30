@@ -16,6 +16,9 @@ models/versions/
 trades_history.json
 .pytest_cache/
 
+# Runtime logs (generados por tests y ejecución)
+logs/
+
 # IDE
 .vscode/
 .idea/

@@ -36,26 +36,46 @@ logger = logging.getLogger(__name__)
 
 # ─── Umbrales por defecto (todos configurables) ────────────────────────────────
 
-# MIN_WINRATE_HOURLY     = 0.52   # umbral original (restaurar cuando haya ≥50 trades)
-# MIN_WINRATE_WEEKDAY    = 0.52   # umbral original (restaurar cuando haya ≥50 trades)
-MIN_WINRATE_HOURLY     = 0.39   # umbral reducido mientras se acumulan datos (< 50 trades)
-MIN_WINRATE_WEEKDAY    = 0.39   # umbral reducido mientras se acumulan datos (< 50 trades)
+# Historial: 0.52 (original) → 0.39 (acumulación datos) → 0.55 (remediación)
+# 0.55 = breakeven con margen de seguridad sobre payout 80-83%
+# Valor temporal durante remediación. Tarea 2.4 implementa walk-forward definitivo.
+MIN_WINRATE_HOURLY     = 0.55
+MIN_WINRATE_WEEKDAY    = 0.55
 MIN_WINRATE_DATA_FLOOR = 10     # trades mínimos históricos para aplicar filtro
+# WARNING: Setting WALKFORWARD_ENABLED to True without implementing walk-forward
+# logic (see CHANGELOG_REMEDIATION.md "Walk-forward specification") will REVERT
+# to curve-fitting behavior. The original hour_profile_filter and
+# weekday_profile_filter were curve-fitting risks. Do NOT enable until
+# walk-forward logic is properly implemented and validated with 90+ days of data.
+WALKFORWARD_ENABLED: bool = False  # True cuando walk-forward esté implementado
 ATR_PERIOD             = 14
 ATR_PERCENTILE_LOW     = 30     # bloquear si ATR está por debajo de este percentil
 ATR_PERCENTILE_HIGH    = 95     # bloquear si ATR está por encima de este percentil
 MIN_PAYOUT             = 0.80   # payout mínimo del par para operar
-MAX_DAILY_LOSSES       = 3      # pérdidas diarias máximas (auto-shutdown)
+MAX_ASSET_DAILY_LOSSES = 3      # pérdidas máximas por activo individual en sesión UTC
+MAX_DAILY_LOSSES       = 6      # pérdidas globales máximas (auto-shutdown) — subido de 3
 MAX_CONSECUTIVE_LOSSES = 3      # pérdidas consecutivas máximas (auto-shutdown)
+TIE_BREAKS_LOSS_STREAK = True   # True = TIE rompe racha de pérdidas (resultado neutral, no continuación adversa)
 MAX_TRADES_PER_DAY     = 15    # operaciones diarias máximas
 BLOCKED_HOURS          = frozenset({0, 1, 2, 3, 14})   # horas UTC con winrate < 40%
 BLOCKED_WEEKDAYS       = frozenset({1, 5})              # 1=Martes, 5=Sábado
 BLOCKED_ASSETS         = frozenset({"GBPUSD-OTC", "EURGBP-OTC"})  # winrate < 43%
 MIN_STREAK_LENGTH      = 3     # rachas de 1-2 velas no tienen edge
+BB_SLOPE_THRESHOLD_PCT = 0.08  # pendiente de BB_mid en % del precio (5 velas) — anti-caminata de banda
+SESSION_RESET_TIMEZONE = "UTC"  # Todos los contadores diarios se resetean a 00:00 UTC
 LOSS_PATTERN_DAYS      = 7     # días hacia atrás para buscar patrones de pérdida
 LOSS_PATTERN_MIN_COUNT = 3     # mínimo de pérdidas similares para bloquear
 LOSS_PATTERN_RSI_TOL   = 8.0   # tolerancia de RSI para considerar "similar"
 LOSS_PATTERN_BB_TOL    = 0.15  # tolerancia de bb_pct_b para considerar "similar"
+
+
+# ─── Helper: fecha UTC del día ───────────────────────────────────────────────
+
+def _today_utc() -> str:
+    """Retorna la fecha actual en UTC como string ISO (YYYY-MM-DD).
+    Todos los contadores diarios usan esta función para garantizar
+    reset a 00:00 UTC independiente del timezone del servidor."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 # ─── Resultado del filtro ─────────────────────────────────────────────────────
@@ -88,11 +108,16 @@ def hour_profile_filter(
     Bloquea operaciones en franjas horarias donde el winrate histórico
     del activo sea menor al umbral mínimo.
 
-    Pasa automáticamente si no hay suficiente data histórica (fail-open).
+    DESACTIVADO cuando WALKFORWARD_ENABLED=False (remediación).
+    La lógica actual es curve-fitting retrospectivo — será reemplazada
+    por walk-forward validado cuando haya 90+ días de datos.
     """
+    if not WALKFORWARD_ENABLED:
+        return FilterResult.ok()  # Desactivado: curve-fitting eliminado
+
     hourly = get_winrate_by_hour(asset=asset)
     if hour_utc not in hourly:
-        return FilterResult.ok()   # sin datos suficientes → no bloquear
+        return FilterResult.ok()
 
     wr = hourly[hour_utc]
     if wr < min_winrate:
@@ -112,10 +137,15 @@ def weekday_profile_filter(
 ) -> FilterResult:
     """
     Bloquea operaciones en días de semana con winrate histórico bajo.
-    Aplica a sábado/domingo (OTC opera 24/7) donde el comportamiento suele diferir.
+
+    DESACTIVADO cuando WALKFORWARD_ENABLED=False (remediación).
+    Será reemplazado por walk-forward cuando haya 90+ días de datos.
 
     weekday: 0=lunes … 6=domingo
     """
+    if not WALKFORWARD_ENABLED:
+        return FilterResult.ok()  # Desactivado: curve-fitting eliminado
+
     by_day = get_winrate_by_weekday(asset=asset)
     if weekday not in by_day:
         return FilterResult.ok()
@@ -206,11 +236,12 @@ def daily_loss_filter(
     max_daily_losses: int = MAX_DAILY_LOSSES,
 ) -> FilterResult:
     """
-    Apaga el bot si las pérdidas cerradas hoy superan el límite configurado.
+    Apaga el bot si las pérdidas cerradas hoy (UTC) superan el límite configurado.
 
     auto_shutdown=True: este filtro apaga el bot, no solo salta el ciclo.
+    El conteo se resetea a 00:00 UTC (SESSION_RESET_TIMEZONE).
     """
-    today = date.today().isoformat()
+    today = _today_utc()
     losses_today = sum(
         1
         for t in trade_log
@@ -218,9 +249,13 @@ def daily_loss_filter(
         and str(t.get("timestamp", ""))[:10] == today
     )
     if losses_today >= max_daily_losses:
+        logger.warning(
+            f"[DAILY_LOSS] {losses_today} pérdidas hoy (UTC: {today}) ≥ límite {max_daily_losses}. "
+            "Auto-shutdown activado."
+        )
         return FilterResult.block(
             "daily_loss_filter",
-            f"{losses_today} pérdidas hoy ≥ límite {max_daily_losses}. Bot detenido por el resto del día.",
+            f"{losses_today} pérdidas hoy (UTC) ≥ límite {max_daily_losses}. Bot detenido por el resto del día.",
             shutdown=True,
         )
     return FilterResult.ok()
@@ -231,14 +266,25 @@ def daily_loss_filter(
 def consecutive_loss_filter(
     trade_log: List[Dict],
     max_consecutive: int = MAX_CONSECUTIVE_LOSSES,
+    tie_breaks: bool = TIE_BREAKS_LOSS_STREAK,
 ) -> FilterResult:
     """
     Apaga el bot tras N pérdidas consecutivas al final del trade_log.
     Una racha de pérdidas puede indicar drift del generador OTC.
 
+    Política de TIE (configurable via TIE_BREAKS_LOSS_STREAK):
+      tie_breaks=True  → TIE rompe la racha (resultado neutral, no continuación adversa).
+      tie_breaks=False → TIE es invisible (comportamiento legacy).
+
     auto_shutdown=True: apaga el bot.
     """
-    closed = [t for t in trade_log if t.get("result") in ("WIN", "LOSS")]
+    if tie_breaks:
+        # TIE entra en la secuencia evaluada y puede romper la racha
+        closed = [t for t in trade_log if t.get("result") in ("WIN", "LOSS", "TIE")]
+    else:
+        # TIE invisible: solo WIN/LOSS (comportamiento legacy)
+        closed = [t for t in trade_log if t.get("result") in ("WIN", "LOSS")]
+
     if not closed:
         return FilterResult.ok()
 
@@ -247,6 +293,8 @@ def consecutive_loss_filter(
         if t["result"] == "LOSS":
             streak += 1
         else:
+            if t["result"] == "TIE" and tie_breaks:
+                logger.debug("[CONSECUTIVE_LOSS] TIE breaks streak. Counter reset.")
             break
 
     if streak >= max_consecutive:
@@ -267,8 +315,9 @@ def max_trades_filter(
     """
     Bloquea operaciones adicionales una vez alcanzado el límite diario.
     Controla la sobreexposición en un solo día.
+    El conteo se resetea a 00:00 UTC (SESSION_RESET_TIMEZONE).
     """
-    today = date.today().isoformat()
+    today = _today_utc()
     trades_today = sum(
         1
         for t in trade_log
@@ -278,7 +327,7 @@ def max_trades_filter(
     if trades_today >= max_trades:
         return FilterResult.block(
             "max_trades_filter",
-            f"{trades_today} operaciones hoy ≥ límite {max_trades}. Esperando mañana.",
+            f"{trades_today} operaciones hoy (UTC) ≥ límite {max_trades}. Esperando mañana.",
         )
     return FilterResult.ok()
 
@@ -335,6 +384,92 @@ def blocked_asset_filter(asset: str) -> FilterResult:
             "blocked_asset_filter",
             f"{asset} bloqueado (winrate histórico < 43%)",
         )
+    return FilterResult.ok()
+
+
+# ─── 8b. Filtro de pérdidas por activo ───────────────────────────────────────
+
+def per_asset_loss_filter(
+    trade_log: List[Dict],
+    asset: str,
+    max_losses: int = MAX_ASSET_DAILY_LOSSES,
+) -> FilterResult:
+    """
+    Bloquea un activo si acumuló >= max_losses pérdidas hoy (UTC).
+
+    A diferencia de daily_loss_filter (global, auto_shutdown), este filtro
+    solo bloquea el activo individual. El bot sigue operando otros pares.
+    El conteo se resetea a 00:00 UTC (SESSION_RESET_TIMEZONE).
+    """
+    today = _today_utc()
+    losses = sum(
+        1
+        for t in trade_log
+        if t.get("result") == "LOSS"
+        and t.get("asset") == asset
+        and str(t.get("timestamp", ""))[:10] == today
+    )
+    if losses >= max_losses:
+        logger.info(
+            f"[PER_ASSET_LOSS] {asset}: {losses} pérdidas hoy (UTC: {today}) "
+            f"≥ límite {max_losses}. Activo bloqueado para el resto del día."
+        )
+        return FilterResult.block(
+            "per_asset_loss_filter",
+            f"{asset}: {losses} pérdidas hoy (UTC) ≥ límite {max_losses}. Activo bloqueado.",
+        )
+    return FilterResult.ok()
+
+
+def bb_slope_filter(
+    df: pd.DataFrame,
+    direction: Optional[str],
+    threshold_pct: float = BB_SLOPE_THRESHOLD_PCT,
+) -> FilterResult:
+    """
+    Bloquea señales contra-tendencia cuando BB_mid tiene pendiente fuerte.
+
+    Mide la pendiente de la SMA central de Bollinger sobre 5 velas.
+    Si la pendiente indica tendencia fuerte y la señal es contra-tendencia,
+    bloquea (el mercado está "caminando la banda", no revirtiendo).
+
+    Señales pro-tendencia y mercados laterales pasan siempre.
+    """
+    if direction is None or len(df) < 6:
+        return FilterResult.ok()
+
+    bb_mid_now = float(df.iloc[-1]["bb_mid"])
+    bb_mid_5   = float(df.iloc[-6]["bb_mid"])
+
+    if bb_mid_now == 0:
+        return FilterResult.ok()
+
+    slope_pct = (bb_mid_now - bb_mid_5) / bb_mid_now * 100
+
+    # PUT contra tendencia alcista fuerte → bloquear
+    if direction == "PUT" and slope_pct >= threshold_pct:
+        logger.info(
+            f"[BB_SLOPE] Tendencia alcista activa (slope={slope_pct:+.3f}%), "
+            f"bloqueando señal PUT contra-tendencia"
+        )
+        return FilterResult.block(
+            "bb_slope_filter",
+            f"Tendencia alcista activa (BB_mid slope={slope_pct:+.3f}%), "
+            f"bloqueando señal PUT contra-tendencia",
+        )
+
+    # CALL contra tendencia bajista fuerte → bloquear
+    if direction == "CALL" and slope_pct <= -threshold_pct:
+        logger.info(
+            f"[BB_SLOPE] Tendencia bajista activa (slope={slope_pct:+.3f}%), "
+            f"bloqueando señal CALL contra-tendencia"
+        )
+        return FilterResult.block(
+            "bb_slope_filter",
+            f"Tendencia bajista activa (BB_mid slope={slope_pct:+.3f}%), "
+            f"bloqueando señal CALL contra-tendencia",
+        )
+
     return FilterResult.ok()
 
 
@@ -430,6 +565,7 @@ def check_all_filters(
     direction: Optional[str] = None,
     min_winrate: float = MIN_WINRATE_HOURLY,
     min_payout: float = MIN_PAYOUT,
+    max_asset_losses: int = MAX_ASSET_DAILY_LOSSES,
     max_daily_losses: int = MAX_DAILY_LOSSES,
     max_consecutive: int = MAX_CONSECUTIVE_LOSSES,
     max_trades: int = MAX_TRADES_PER_DAY,
@@ -442,16 +578,17 @@ def check_all_filters(
       1. Hora bloqueada (instantáneo)
       2. Día bloqueado (instantáneo)
       3. Activo bloqueado (instantáneo)
-      4. Pérdidas diarias (auto-shutdown, barato)
-      5. Pérdidas consecutivas (auto-shutdown, barato)
-      6. Máximo de operaciones diarias (barato)
-      7. Drift del generador (archivo en disco, barato)
-      8. Perfil horario (DB, medio)
-      9. Perfil por día de semana (DB, medio)
-     10. Volatilidad / ATR (cálculo numérico, medio)
-     11. Payout (valor pasado como parámetro, barato)
-     12. Racha mínima (cálculo, medio)
-     13. Patrón de pérdida (DB, medio)
+      4. Pérdidas por activo (bloquea solo ese activo, barato)
+      5. Pérdidas diarias globales (auto-shutdown, barato)
+      6. Pérdidas consecutivas (auto-shutdown, barato)
+      8. Drift del generador (archivo en disco, barato)
+      9. Perfil horario (DB, medio)
+     10. Perfil por día de semana (DB, medio)
+     11. Volatilidad / ATR (cálculo numérico, medio)
+     12. Pendiente BB media (anti-caminata, medio)
+     13. Payout (valor pasado como parámetro, barato)
+     14. Racha mínima (cálculo, medio)
+     15. Patrón de pérdida (DB, medio)
     """
     now_utc = datetime.now(timezone.utc)
 
@@ -459,6 +596,7 @@ def check_all_filters(
         lambda: blocked_hours_filter(now_utc.hour),
         lambda: blocked_weekday_filter(now_utc.weekday()),
         lambda: blocked_asset_filter(asset),
+        lambda: per_asset_loss_filter(trade_log, asset, max_asset_losses),
         lambda: daily_loss_filter(trade_log, max_daily_losses),
         lambda: consecutive_loss_filter(trade_log, max_consecutive),
         lambda: max_trades_filter(trade_log, max_trades),
@@ -466,6 +604,7 @@ def check_all_filters(
         lambda: hour_profile_filter(now_utc.hour, asset, min_winrate),
         lambda: weekday_profile_filter(now_utc.weekday(), asset, min_winrate),
         lambda: volatility_filter(df),
+        lambda: bb_slope_filter(df, direction),
         lambda: payout_filter(payout, min_payout),
         lambda: min_streak_filter(df),
         lambda: loss_pattern_filter(df, asset, direction) if direction else FilterResult.ok(),

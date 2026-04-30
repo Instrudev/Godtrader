@@ -15,10 +15,15 @@ Cuando no hay modelo entrenado → devuelve {"call_proba": 0.5, "put_proba": 0.5
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import pickle
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from ml_drift_detector import drift_detector
 
 import numpy as np
 import pandas as pd
@@ -196,7 +201,8 @@ class MLClassifier:
     """
     Wrapper del modelo LightGBM + calibrador Platt.
 
-    Carga el modelo de forma lazy en la primera predicción (o llamando a load()).
+    Carga explícita via load() o load_with_verification().
+    Auto-carga implícita bloqueada en REMEDIATION_MODE.
     Si no existe modelo guardado, devuelve probabilidades neutras (0.5).
     """
 
@@ -205,12 +211,24 @@ class MLClassifier:
         self._calibrator  = None
         self._loaded      = False
         self._load_attempted = False
+        self._model_hash: Optional[str]  = None
+        self._model_path: Optional[Path] = None
+        self._predict_count: int = 0
 
     # ── Carga ─────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        """Calcula SHA256 de un archivo."""
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
     def load(self, model_path: Path = MODEL_PATH, calib_path: Path = CALIBRATOR_PATH) -> bool:
         """
-        Carga el modelo y calibrador desde disco.
+        Carga el modelo y calibrador desde disco con logging completo.
 
         Returns:
             True si la carga fue exitosa, False si falta algún archivo.
@@ -224,20 +242,89 @@ class MLClassifier:
             return False
 
         try:
+            model_hash = self._sha256(model_path)
+            mod_time = datetime.fromtimestamp(
+                os.path.getmtime(model_path), tz=timezone.utc
+            ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
             with open(model_path, "rb") as f:
                 self._model = pickle.load(f)
             with open(calib_path, "rb") as f:
                 self._calibrator = pickle.load(f)
+
             self._loaded = True
-            logger.info(f"Modelo ML cargado desde {model_path}")
+            self._model_hash = model_hash
+            self._model_path = model_path
+            self._predict_count = 0
+
+            # Feature importances summary
+            n_features = getattr(self._model, "n_features_", "?")
+            importances = getattr(self._model, "feature_importances_", [])
+            nonzero = sum(1 for v in importances if v > 0)
+
+            logger.info(
+                f"[ML] Modelo cargado | path={model_path} | "
+                f"hash={model_hash[:12]}... | modified={mod_time} | "
+                f"features={n_features} (active={nonzero})"
+            )
             return True
         except Exception as exc:
             logger.error(f"Error cargando modelo ML: {exc}")
             self._loaded = False
             return False
 
+    def load_with_verification(
+        self,
+        model_path: Path = MODEL_PATH,
+        calib_path: Path = CALIBRATOR_PATH,
+        expected_hash: Optional[str] = None,
+    ) -> bool:
+        """
+        Carga el modelo con verificación SHA256 opcional.
+
+        Si expected_hash se proporciona y no coincide, la carga falla
+        y se registra en logs/security_halts.log.
+
+        Returns:
+            True si la carga fue exitosa y el hash coincide (si se verificó).
+        """
+        if not model_path.exists():
+            logger.info(f"Modelo no encontrado en {model_path}.")
+            return False
+
+        actual_hash = self._sha256(model_path)
+
+        if expected_hash is not None and actual_hash != expected_hash:
+            logger.error(
+                f"[ML] HASH MISMATCH | expected={expected_hash[:12]}... "
+                f"actual={actual_hash[:12]}... | path={model_path}"
+            )
+            try:
+                from iqservice import _security_logger
+                ts = datetime.now(timezone.utc).isoformat()
+                _security_logger.warning(
+                    f"[{ts}] HALT_TYPE=ML_MODEL_HASH_MISMATCH "
+                    f"expected={expected_hash} actual={actual_hash} "
+                    f"path={model_path} "
+                    f"action_required=Verify model integrity before loading"
+                )
+            except Exception:
+                pass
+            return False
+
+        return self.load(model_path, calib_path)
+
     def is_loaded(self) -> bool:
         return self._loaded
+
+    def get_model_info(self) -> Dict:
+        """Snapshot del modelo cargado para auditoría."""
+        return {
+            "loaded": self._loaded,
+            "path": str(self._model_path) if self._model_path else None,
+            "hash": self._model_hash,
+            "predict_count": self._predict_count,
+        }
 
     # ── Predicción ────────────────────────────────────────────────────────────
 
@@ -245,8 +332,8 @@ class MLClassifier:
         """
         Devuelve probabilidades de éxito para CALL y PUT.
 
-        Si el modelo no está cargado, intenta cargarlo una vez. Si falla,
-        devuelve probabilidades neutras (0.5).
+        Auto-carga implícita bloqueada en REMEDIATION_MODE.
+        Si el modelo no está cargado, devuelve probabilidades neutras (0.5).
 
         Args:
             features: Dict con las claves de FEATURE_COLS. La clave "direction"
@@ -256,10 +343,29 @@ class MLClassifier:
             {"call_proba": float, "put_proba": float} en rango [0, 1].
         """
         if not self._loaded and not self._load_attempted:
-            self.load()
+            # Bloquear auto-carga en REMEDIATION_MODE
+            try:
+                from iqservice import REMEDIATION_MODE
+                if REMEDIATION_MODE:
+                    logger.warning(
+                        "[ML] Auto-carga bloqueada en REMEDIATION_MODE. "
+                        "Usar load() o load_with_verification() explícitamente."
+                    )
+                    self._load_attempted = True
+                else:
+                    self.load()
+            except ImportError:
+                self.load()
 
         if not self._loaded:
             return dict(_NEUTRAL)
+
+        self._predict_count += 1
+        if self._predict_count % 100 == 0:
+            logger.info(
+                f"[ML] Checkpoint: {self._predict_count} predicciones | "
+                f"modelo={self._model_hash[:12] if self._model_hash else '?'}..."
+            )
 
         try:
             # call_proba: features con direction=CALL(1)
@@ -282,6 +388,12 @@ class MLClassifier:
             # Clamp al rango [0, 1] por seguridad
             call_proba = max(0.0, min(1.0, call_proba))
             put_proba  = max(0.0, min(1.0, put_proba))
+
+            # Registrar predicción para drift detection
+            try:
+                drift_detector.record_prediction(call_proba, put_proba)
+            except Exception as exc:
+                logger.debug(f"[ML_DRIFT] record error: {exc}")
 
             return {"call_proba": call_proba, "put_proba": put_proba}
 

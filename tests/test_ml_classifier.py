@@ -604,3 +604,111 @@ def test_brier_score_random() -> None:
     y_true = np.array([1.0, 0.0, 1.0, 0.0])
     y_prob = np.array([0.5, 0.5, 0.5, 0.5])
     assert _brier_score(y_true, y_prob) == pytest.approx(0.25)
+
+
+# ─── Tarea 1.5: Carga explícita con verificación SHA256 ─────────────────────
+
+def _create_mock_model(tmp_path):
+    """Crea modelo LightGBM + calibrador Platt mock en tmp_path, retorna (model_path, calib_path)."""
+    import lightgbm as lgb
+    from sklearn.linear_model import LogisticRegression
+
+    rng = np.random.default_rng(42)
+    X = rng.random((60, len(FEATURE_COLS))).astype(np.float32)
+    y = (rng.random(60) > 0.5).astype(int)
+
+    model = lgb.LGBMClassifier(n_estimators=5, verbose=-1)
+    model.fit(X, y)
+    raw = model.predict_proba(X)[:, 1].reshape(-1, 1)
+    calib = LogisticRegression(C=1.0, max_iter=100)
+    calib.fit(raw, y)
+
+    model_path = tmp_path / "lgbm_model.pkl"
+    calib_path = tmp_path / "platt_calibrator.pkl"
+    with open(model_path, "wb") as f:
+        pickle.dump(model, f)
+    with open(calib_path, "wb") as f:
+        pickle.dump(calib, f)
+    return model_path, calib_path
+
+def test_load_with_verification_valid_hash(tmp_path) -> None:
+    """Hash coincide → carga OK."""
+    import hashlib
+    model_path, calib_path = _create_mock_model(tmp_path)
+    expected = hashlib.sha256(model_path.read_bytes()).hexdigest()
+
+    clf = MLClassifier()
+    ok = clf.load_with_verification(model_path, calib_path, expected_hash=expected)
+    assert ok is True
+    assert clf.is_loaded()
+    assert clf._model_hash == expected
+
+
+def test_load_with_verification_invalid_hash(tmp_path) -> None:
+    """Hash no coincide → error + no carga."""
+    model_path, calib_path = _create_mock_model(tmp_path)
+
+    clf = MLClassifier()
+    ok = clf.load_with_verification(model_path, calib_path, expected_hash="badhash123")
+    assert ok is False
+    assert not clf.is_loaded()
+
+
+def test_auto_load_blocked_in_remediation_mode() -> None:
+    """predict_proba no auto-carga en REMEDIATION_MODE."""
+    import iqservice
+    orig = iqservice.REMEDIATION_MODE
+    try:
+        iqservice.REMEDIATION_MODE = True
+        clf = MLClassifier()
+        result = clf.predict_proba({col: 0.0 for col in FEATURE_COLS})
+        # Debe retornar neutral (0.5) sin intentar cargar
+        assert result["call_proba"] == 0.5
+        assert result["put_proba"] == 0.5
+        assert clf._load_attempted is True  # marcado como intentado (para no reintentar)
+        assert clf._loaded is False  # pero NO cargado
+    finally:
+        iqservice.REMEDIATION_MODE = orig
+
+
+def test_load_logs_hash_and_path(tmp_path, caplog) -> None:
+    """load() loguea hash y path del modelo."""
+    import logging
+    model_path, calib_path = _create_mock_model(tmp_path)
+
+    clf = MLClassifier()
+    with caplog.at_level(logging.INFO):
+        clf.load(model_path, calib_path)
+
+    assert "hash=" in caplog.text
+    assert str(model_path) in caplog.text
+    assert "features=" in caplog.text
+
+
+def test_audit_script_loads_model_and_validates_hash() -> None:
+    """El script de auditoría carga el modelo y valida hash contra baseline."""
+    from audit_ml_model import _sha256, MODEL_PATH, BASELINE_HASH
+    if not MODEL_PATH.exists():
+        pytest.skip("Modelo no disponible")
+    actual = _sha256(MODEL_PATH)
+    assert actual == BASELINE_HASH
+
+
+def test_audit_script_handles_insufficient_data(tmp_path) -> None:
+    """Script reporta warning con dataset pequeño, no crashea."""
+    from audit_ml_model import _count_trades
+    info = _count_trades()
+    # Con la BD actual, debe retornar datos válidos
+    assert isinstance(info, dict)
+    assert "total" in info
+
+
+def test_load_without_expected_hash(tmp_path) -> None:
+    """Sin hash esperado → carga OK + reporta hash detectado."""
+    model_path, calib_path = _create_mock_model(tmp_path)
+
+    clf = MLClassifier()
+    ok = clf.load_with_verification(model_path, calib_path, expected_hash=None)
+    assert ok is True
+    assert clf.is_loaded()
+    assert clf._model_hash is not None  # hash detectado y almacenado

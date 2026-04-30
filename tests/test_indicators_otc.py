@@ -401,10 +401,10 @@ def test_pre_qualify_classical_returns_tuple() -> None:
 
 
 def test_pre_qualify_classical_passes_with_oversold_rsi() -> None:
-    """Si RSI < 35 y precio en zona baja de BB, debe pasar."""
+    """Si RSI < 25 y precio en zona baja de BB (pct_b <= 0.10), debe pasar."""
     df = _make_df(250)
-    # Forzar condiciones en última vela
-    df.at[df.index[-1], "rsi"]      = 28.0
+    # Forzar condiciones en última vela (Tarea 2.2: umbrales 25/75, zone 10%)
+    df.at[df.index[-1], "rsi"]      = 20.0
     df.at[df.index[-1], "close"]    = float(df["bb_lower"].iloc[-1]) * 0.9999
     ok, reason = pre_qualify_classical(df)
     assert ok is True
@@ -416,6 +416,52 @@ def test_pre_qualify_classical_blocks_neutral_rsi() -> None:
     df.at[df.index[-1], "rsi"] = 50.0
     ok, _ = pre_qualify_classical(df)
     assert ok is False
+
+
+# ─── Tarea 2.3: BB Body Reversal CALL espejo ─────────────────────────────────
+
+def test_bb_body_call_detects_red_candle() -> None:
+    """Espejo CALL detecta vela roja insostenible con bb_mid alto."""
+    from indicators import detect_bb_body_reversal_call
+    df = _make_df(250)
+    # Vela roja gigante: open alto, close bajo, bb_mid en zona superior
+    df.at[df.index[-1], "open"]     = 1.1050
+    df.at[df.index[-1], "close"]    = 1.1000
+    df.at[df.index[-1], "bb_mid"]   = 1.1048  # en 96% del cuerpo (>90% threshold)
+    df.at[df.index[-1], "bb_width"] = 0.50
+    df.at[df.index[-1], "rsi"]      = 30.0   # < 45 → confirma sobreextensión bajista
+    df.at[df.index[-1], "vol_rel"]  = 1.5
+
+    ok, reason = detect_bb_body_reversal_call(df)
+    assert ok is True
+    assert "bb_body_call" in reason
+
+
+def test_bb_body_call_rejects_green_candle() -> None:
+    """Espejo CALL no activa con vela verde (necesita roja)."""
+    from indicators import detect_bb_body_reversal_call
+    df = _make_df(250)
+    df.at[df.index[-1], "open"]  = 1.1000
+    df.at[df.index[-1], "close"] = 1.1050  # verde (close > open)
+    ok, reason = detect_bb_body_reversal_call(df)
+    assert ok is False
+    assert "bajista" in reason.lower()
+
+
+def test_bb_body_call_rsi_threshold_45() -> None:
+    """Espejo CALL: RSI ≥ 45 no activa (necesita < 45 para sobreextensión bajista)."""
+    from indicators import detect_bb_body_reversal_call
+    df = _make_df(250)
+    df.at[df.index[-1], "open"]     = 1.1050
+    df.at[df.index[-1], "close"]    = 1.1000
+    df.at[df.index[-1], "bb_mid"]   = 1.1048
+    df.at[df.index[-1], "bb_width"] = 0.50
+    df.at[df.index[-1], "rsi"]      = 50.0   # ≥ 45 → no activa
+    df.at[df.index[-1], "vol_rel"]  = 1.5
+
+    ok, reason = detect_bb_body_reversal_call(df)
+    assert ok is False
+    assert "RSI" in reason
 
 
 # ─── load_strategy_config ─────────────────────────────────────────────────────

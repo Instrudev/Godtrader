@@ -4,8 +4,12 @@ Gestiona conexión, listado de activos, datos históricos,
 stream en tiempo real y ejecución de órdenes.
 """
 
+import inspect
 import logging
+import os
 import time
+import traceback
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from iqoptionapi.stable_api import IQ_Option
@@ -13,6 +17,39 @@ from iqoptionapi.api import IQOptionAPI
 import iqoptionapi.global_value as global_value
 
 logger = logging.getLogger(__name__)
+
+# ─── Configuración de Remediación ────────────────────────────────────────────
+# Estas constantes controlan el halt operativo durante la fase de remediación.
+# Para salir del modo remediación, ver CHANGELOG_REMEDIATION.md.
+
+REMEDIATION_MODE: bool = True       # True = branch de remediación activa
+FORCE_DEMO_ACCOUNT: bool = True     # True = bloquear ejecución en cuenta real
+ALLOWED_ACCOUNT_TYPES = {"PRACTICE"}  # Whitelist de tipos de cuenta permitidos
+ALLOW_DEPRECATED_TRADERS: bool = False  # True = permitir import de trader/paper_trader/ai_brain
+
+# ─── Modo sin ML (Tarea 1.6) ────────────────────────────────────────────────
+# Activado tras hallazgos de Tarea 1.5: modelo ML no añade valor predictivo real.
+# Temporal hasta reentrenamiento con AUC ≥ 0.62 (Tarea 3.1).
+
+ML_DISABLED_MODE: bool = True              # True = operar sin ML gate
+ML_DISABLED_MIN_SCORE: float = 0.75        # Score mínimo de estrategia sin ML
+ML_DISABLED_MAX_ASSET_LOSSES: int = 2      # Pérdidas máx por activo (vs 3 normal)
+ML_DISABLED_MAX_DAILY_LOSSES: int = 4      # Pérdidas máx globales (vs 6 normal)
+ML_DISABLED_MAX_DAILY_TRADES: int = 5      # Trades máx por día (vs 15 normal)
+
+# ─── Logger de seguridad dedicado ────────────────────────────────────────────
+
+_security_logger = logging.getLogger("security_halts")
+_security_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_security_log_dir, exist_ok=True)
+_security_handler = logging.FileHandler(
+    os.path.join(_security_log_dir, "security_halts.log"), encoding="utf-8"
+)
+_security_handler.setFormatter(
+    logging.Formatter("%(message)s")
+)
+_security_logger.addHandler(_security_handler)
+_security_logger.setLevel(logging.WARNING)
 
 class Exnova_Option(IQ_Option):
     """
@@ -94,16 +131,94 @@ class IQService:
         Establece conexión con Exnova dinámicamente.
 
         El bot operará en modo PRÁCTICA por defecto.
+        Tras conectar, sincroniza el diccionario de activos de la librería
+        con todos los activos disponibles en el broker.
         """
         self.api = Exnova_Option(email, password)
         check, reason = self.api.connect()
         if check:
             self.connected = True
             self.api.change_balance('PRACTICE')  # Asegurado: siempre operará en práctica
-            logger.info(f"Conectado a Exnova en cuenta PRÁCTICA | {email}")
+            self._sync_actives()
+            self._log_startup_banner(email)
         else:
             logger.error(f"Fallo de conexión a Exnova: {reason}")
         return check, reason
+
+    def _log_startup_banner(self, email: str) -> None:
+        """Loguea banner de seguridad con estado de remediación y tipo de cuenta."""
+        try:
+            account_type = self.get_account_type()
+        except Exception:
+            account_type = "UNKNOWN"
+
+        mode_label = "REMEDIATION" if REMEDIATION_MODE else "PRODUCTION"
+        guard_label = "ACTIVE" if FORCE_DEMO_ACCOUNT else "DISABLED"
+        match = account_type in ALLOWED_ACCOUNT_TYPES
+
+        banner = (
+            f"\n{'=' * 60}\n"
+            f"  STARTUP SECURITY CHECK\n"
+            f"  Mode:           {mode_label}\n"
+            f"  Demo Guard:     {guard_label}\n"
+            f"  Account Type:   {account_type}\n"
+            f"  Allowed Types:  {ALLOWED_ACCOUNT_TYPES}\n"
+            f"  Config Match:   {'OK' if match else 'MISMATCH — ORDERS WILL BE BLOCKED'}\n"
+            f"  User:           {email}\n"
+            f"{'=' * 60}"
+        )
+
+        if REMEDIATION_MODE:
+            logger.warning(f"REMEDIATION MODE — DEMO ONLY{banner}")
+        else:
+            logger.info(f"Production mode{banner}")
+
+    def _sync_actives(self) -> None:
+        """
+        Inyecta activos del broker en el diccionario de la librería iqoptionapi.
+        Sin esto, get_candles() falla para activos nuevos (crypto OTC, commodities, etc.)
+        que no están en el constants.ACTIVES hardcodeado de la librería.
+        """
+        try:
+            import iqoptionapi.constants as OP_code
+            binary_data = self.api.get_all_init_v2()
+            injected = 0
+            for opt_type in ("binary", "turbo"):
+                actives = binary_data.get(opt_type, {}).get("actives", {})
+                for active_id, active in actives.items():
+                    raw_name = str(active.get("name", ""))
+                    name = raw_name.split(".")[-1] if "." in raw_name else raw_name
+                    if name and name not in OP_code.ACTIVES:
+                        try:
+                            OP_code.ACTIVES[name] = int(active_id)
+                            injected += 1
+                        except (ValueError, TypeError):
+                            pass
+            if injected:
+                logger.info(f"Sincronizados {injected} activos nuevos del broker (total: {len(OP_code.ACTIVES)})")
+        except Exception as e:
+            logger.warning(f"Error sincronizando activos: {e}")
+
+    def get_account_type(self) -> str:
+        """
+        Consulta al broker el tipo de cuenta activo (PRACTICE o REAL).
+        No depende del monkey-patch de change_balance — lee el estado real.
+
+        Returns:
+            "PRACTICE" o "REAL" según la respuesta del broker.
+
+        Raises:
+            RuntimeError: Si no hay conexión o la respuesta es inesperada.
+        """
+        if self.api is None:
+            raise RuntimeError("API not initialized — cannot determine account type")
+        try:
+            balance_mode = self.api.get_balance_mode()
+            if balance_mode is None:
+                raise RuntimeError("Broker returned None for balance mode")
+            return str(balance_mode).upper()
+        except AttributeError:
+            raise RuntimeError("API does not support get_balance_mode()")
 
     def is_connected(self) -> bool:
         """Verifica de forma segura si la conexión sigue viva. Si no, intenta reconectar."""
@@ -154,7 +269,7 @@ class IQService:
                 for _, active in actives.items():
                     raw_name = str(active.get("name", ""))
                     name = raw_name.split(".")[-1] if "." in raw_name else raw_name
-                    if not name or (supported_names and name not in supported_names):
+                    if not name:
                         continue
                     is_open = (
                         active.get("enabled", False)
@@ -337,6 +452,43 @@ class IQService:
 
     # ─── Ejecución de Órdenes ─────────────────────────────────────────────────
 
+    def _enforce_demo_guard(self, asset: str, direction: str, caller: str) -> None:
+        """
+        Guard fail-closed: verifica que la cuenta es PRACTICE antes de ejecutar.
+        Lanza RuntimeError si la verificación falla por cualquier motivo.
+
+        Se activa cuando FORCE_DEMO_ACCOUNT es True (independiente de REMEDIATION_MODE).
+        """
+        if not FORCE_DEMO_ACCOUNT:
+            return
+
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            account_type = self.get_account_type()
+        except Exception as e:
+            _security_logger.warning(
+                f"[{ts}] HALT_TYPE=DEMO_GUARD asset={asset} direction={direction} "
+                f"account_type_detected=UNKNOWN force_demo={FORCE_DEMO_ACCOUNT} "
+                f"remediation_mode={REMEDIATION_MODE} caller_function={caller} "
+                f"stack_trace={traceback.format_exc(limit=3).strip()}"
+            )
+            raise RuntimeError(
+                f"REMEDIATION MODE — Cannot verify account type: {e}. "
+                "Trade blocked for safety."
+            ) from e
+
+        if account_type not in ALLOWED_ACCOUNT_TYPES:
+            _security_logger.warning(
+                f"[{ts}] HALT_TYPE=DEMO_GUARD asset={asset} direction={direction} "
+                f"account_type_detected={account_type} force_demo={FORCE_DEMO_ACCOUNT} "
+                f"remediation_mode={REMEDIATION_MODE} caller_function={caller} "
+                f"stack_trace={traceback.format_stack(limit=5)}"
+            )
+            raise RuntimeError(
+                f"REMEDIATION MODE — Account type '{account_type}' is not allowed. "
+                f"Only {ALLOWED_ACCOUNT_TYPES} permitted. Trade blocked."
+            )
+
     def buy_binary(
         self, asset: str, amount: float, direction: str, expiry_minutes: int
     ) -> bool:
@@ -352,6 +504,8 @@ class IQService:
         Returns:
             (bool, int): Tupla con estado de aceptación y el order_id.
         """
+        self._enforce_demo_guard(asset, direction, "buy_binary")
+
         if not self.is_connected():
             logger.error("buy_binary: sin conexión.")
             return False, -1
@@ -397,6 +551,8 @@ class IQService:
         Coloca una orden de opción digital.
         Las opciones digitales de IQ Option solo aceptan duraciones de 1m o 5m.
         """
+        self._enforce_demo_guard(asset, direction, "buy_digital")
+
         if not self.is_connected():
             logger.error("buy_digital: sin conexión.")
             return False, -1
